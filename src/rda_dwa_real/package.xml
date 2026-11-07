@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rda_dwa_real</name>
+  <version>0.1.0</version>
+  <description>RL-DWA 实车（非模型版本）适配节点：外部感知/定位/目标点接入 + 控制指令发布，算法核心不变。</description>
+  <maintainer email="dev@rda-dwa.local">RDA-DWA</maintainer>
+  <license>MIT</license>
+
+  <depend>rda_dwa</depend>
+  <depend>rclpy</depend>
+  <depend>tf2_ros</depend>
+  <depend>rcl_interfaces</depend>
+  <exec_depend>ros2bag</exec_depend>
+  <exec_depend>rosbag2_transport</exec_depend>
+  <depend>visualization_msgs</depend>
+  <exec_depend>sensor_msgs_py</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rda_dwa_real_msgs</depend>
+  <depend>control_msgs</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-yaml</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
