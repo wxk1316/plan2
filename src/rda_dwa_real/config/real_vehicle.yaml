@@ -3,7 +3,7 @@
 # Safety margin is separate from physical dimensions. Parameters validated offline; see docs/implementation/20261107.
 rda_dwa_real_bridge:
   ros__parameters:
-    localization_source: tf
+    localization_source: latest_topic
     localization_parent_frame: map
     localization_child_frame: body
     algorithm_frame: map
@@ -42,7 +42,7 @@ rda_dwa_real_bridge:
     gps_topic: ''
     gps_yaw_topic: ''
     gps_yaw_use_diff: false
-    localization_timeout: 0.35
+    localization_timeout: 2.0
     obstacle_timeout: 0.4
     emergency_stop: true
     enable_trap: true
@@ -104,7 +104,8 @@ rda_dwa_real_bridge:
     ack_a_max: 0.7
     ack_dec_max: 1.2
     async_planning: true
-    planning_budget_s: 0.08
+    planning_budget_s: 0.25
+    planning_result_max_age_s: 0.8
     safety_margin: 0.12
     heading_weight: 0.3
     steer_weight: 0.4
@@ -144,7 +145,7 @@ control_bridge_node:
     bridge_state_topic: /car_bridge_state
 traj_tracker_node:
   ros__parameters:
-    localization_source: tf
+    localization_source: latest_topic
     localization_parent_frame: map
     localization_child_frame: body
     wheelbase: 0.69
@@ -218,7 +219,7 @@ traj_tracker_node:
     spin_wait_timeout: 7.0
     spin_stop_speed: 0.035
     yaw_stop_rate: 0.06
-    localization_timeout: 0.35
+    localization_timeout: 2.0
     obstacle_timeout: 0.4
     safety_margin: 0.12
     use_atomic_plan: true
@@ -227,7 +228,7 @@ traj_tracker_node:
     stop_window_s: 1.0
 lidar_track_node:
   ros__parameters:
-    localization_source: tf
+    localization_source: latest_topic
     localization_parent_frame: map
     localization_child_frame: body
     vehicle_length: 1.2
@@ -258,4 +259,4 @@ lidar_track_node:
     static_speed_thr: 0.15
     static_hold_frames: 10
     static_small_thr: 0.6
-    loc_timeout: 0.5
+    loc_timeout: 2.0

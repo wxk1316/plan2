@@ -180,9 +180,10 @@ class RealVehicleBridgeNode(Node):
         self.declare_parameter('gps_yaw_topic', '')           # 可选：std_msgs/Float32 航向(rad)
         self.declare_parameter('gps_yaw_use_diff', True)      # 无航向话题时用 GPS 位移差分估航向
 
-        for key,default in {'planning_budget_s':.08,'safety_margin':.12,'heading_weight':.3,'steer_weight':.12,'steer_change_weight':.08,'guide_extra':.08,'command_acc':.7,'command_steer_rate_deg':30.,'near_goal_spin_distance':4.,'near_goal_spin_angle_deg':65.,'blocked_spin_time':1.2,'spin_speed':.6,'cruise_velocity':1.,'lateral_acc_max':.6,'goal_replay_epsilon':.05,'motion_stall_time':3.,'recovery_subgoal_distance':1.8,'recovery_max_retries':2,'goal_max_spin_requests':4}.items():
+        for key,default in {'planning_budget_s':.25,'safety_margin':.12,'heading_weight':.3,'steer_weight':.12,'steer_change_weight':.08,'guide_extra':.08,'command_acc':.7,'command_steer_rate_deg':30.,'near_goal_spin_distance':4.,'near_goal_spin_angle_deg':65.,'blocked_spin_time':1.2,'spin_speed':.6,'cruise_velocity':1.,'lateral_acc_max':.6,'goal_replay_epsilon':.05,'motion_stall_time':3.,'recovery_subgoal_distance':1.8,'recovery_max_retries':2,'goal_max_spin_requests':4}.items():
             self.declare_parameter(key,default)
         self.declare_parameter('async_planning', True)
+        self.declare_parameter('planning_result_max_age_s', .8)
         self.declare_parameter('velocity_horizon_targets',True)
         cfg = BridgeConfig()
         cfg.algorithm_frame = self.get_parameter('algorithm_frame').value
@@ -297,7 +298,8 @@ class RealVehicleBridgeNode(Node):
         for key in ['near_goal_spin_distance','near_goal_spin_angle_deg','blocked_spin_time','spin_speed','command_acc','command_steer_rate_deg','safety_margin','goal_replay_epsilon','motion_stall_time','recovery_subgoal_distance','recovery_max_retries','goal_max_spin_requests']:
             setattr(cfg,key,self.get_parameter(key).value)
         pp.command_steer_rate=math.radians(float(self.get_parameter('command_steer_rate_deg').value))
-        self._async_planner = AsyncPlanner(planner) if bool(self.get_parameter('async_planning').value) else None
+        result_max_age = float(self.get_parameter('planning_result_max_age_s').value)
+        self._async_planner = AsyncPlanner(planner, max_age=result_max_age) if bool(self.get_parameter('async_planning').value) else None
         if self._async_planner is not None: planner=self._async_planner
         self.planner = planner
 
@@ -473,6 +475,9 @@ class RealVehicleBridgeNode(Node):
         if self._localization_input.uses_tf:
             return
         p = msg.pose.pose
+        if self._localization_input.uses_latest_topic:
+            self._localization_input.receive_topic(p, msg.header)
+            return
         x_body = p.position.x
         y_body = p.position.y
         yaw_body = quat_to_yaw(p.orientation.x, p.orientation.y,
@@ -492,6 +497,9 @@ class RealVehicleBridgeNode(Node):
         if self._localization_input.uses_tf:
             return
         p = msg.pose.pose
+        if self._localization_input.uses_latest_topic:
+            self._localization_input.receive_topic(p, msg.header)
+            return
         x_body = p.position.x
         y_body = p.position.y
         yaw_body = quat_to_yaw(p.orientation.x, p.orientation.y,
@@ -603,7 +611,7 @@ class RealVehicleBridgeNode(Node):
         # 算法 dt 同步为真实周期（M1 窗口/预测时域同源）
         self.planner.params.dt = dt_real
 
-        sample = self._localization_input.sample(cfg.localization_timeout)
+        sample = self._localization_input.sample(cfg.localization_timeout, now=now)
         if sample is not None:
             pose, stamp, age = sample
             x, y, yaw = body_pose_to_base_link(*pose, self._body_to_base_x)

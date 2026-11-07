@@ -177,6 +177,9 @@ class TrajTrackerNode(Node):
         if self._localization_input.uses_tf:
             return
         p = msg.pose.pose
+        if self._localization_input.uses_latest_topic:
+            self._localization_input.receive_topic(p, msg.header, received_at=self._now())
+            return
         x_body = float(p.position.x)
         y_body = float(p.position.y)
         yaw_body = quat_to_yaw(p.orientation.x, p.orientation.y,
@@ -232,7 +235,7 @@ class TrajTrackerNode(Node):
     def _control_tick(self):
         begin=time.monotonic();now=self._now();raw_dt=.02 if self._last_tick is None else now-self._last_tick;dt=max(.001,min(.1,raw_dt));self._last_tick=now
         reason=''
-        sample = self._localization_input.sample(self.core.p.localization_timeout)
+        sample = self._localization_input.sample(self.core.p.localization_timeout, now=now)
         if sample is not None:
             pose, stamp, age = sample
             x, y, yaw = body_pose_to_base_link(*pose, self._body_to_base_x)

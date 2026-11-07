@@ -196,6 +196,9 @@ class LidarTrackNode(Node):
         if self._localization_input.uses_tf:
             return
         p = msg.pose.pose
+        if self._localization_input.uses_latest_topic:
+            self._localization_input.receive_topic(p, msg.header)
+            return
         x_body = p.position.x
         y_body = p.position.y
         yaw_body = quat_to_yaw(p.orientation.x, p.orientation.y,
@@ -209,7 +212,7 @@ class LidarTrackNode(Node):
 
     def _cb_cloud(self,msg:PointCloud2):
         begin=time.monotonic();self._perception_seq+=1
-        sample = self._localization_input.sample(self._loc_timeout)
+        sample = self._localization_input.sample(self._loc_timeout, now=begin)
         if sample is not None:
             pose, stamp, _ = sample
             self._loc = body_pose_to_base_link(*pose, self._body_to_base_x)
@@ -217,6 +220,12 @@ class LidarTrackNode(Node):
         stamp=msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9
         self._perception_metrics=dict(schema_version=1,sequence=self._perception_seq,source_stamp=stamp,source_frame=msg.header.frame_id,source_age_s=self.get_clock().now().nanoseconds*1e-9-stamp,raw_points=msg.width*msg.height,raw_bytes=len(msg.data),location_pose_used=self._loc,location_source_stamp=self._loc_t,location_age_s=self.get_clock().now().nanoseconds*1e-9-self._loc_t)
         self._perception_metrics['localization_input'] = self._localization_input.diagnostic()
+        if self._localization_input.uses_latest_topic:
+            self._perception_metrics.update(
+                location_source_stamp=self._localization_input.stamp,
+                location_effective_stamp=self._loc_t,
+                location_age_s=begin-self._loc_t,
+                location_age_clock='monotonic_receive')
         try:self._perception_metrics['reason']=self._process_cloud(msg)
         except Exception as exc:
             self._perception_metrics['reason']='exception';self._perception_metrics['exception']=type(exc).__name__;raise
@@ -235,7 +244,8 @@ class LidarTrackNode(Node):
         self._last_cloud_source=stamp;self._cloud_source_stamp=msg.header.stamp
         if self._loc is None:
             return 'no_localization'  # 尚无定位，不发布（bridge 定位超时急停）
-        now = self.get_clock().now().nanoseconds * 1e-9
+        now = (time.monotonic() if self._localization_input.uses_latest_topic
+               else self.get_clock().now().nanoseconds * 1e-9)
         if now - self._loc_t > self._loc_timeout:
             return 'localization_stale'  # 定位超时，保持上一帧障碍（bridge obstacle_timeout 兜底清空）
         if self._pub_obs is None:
