@@ -55,6 +55,7 @@ from .obstacle_fusion import Clusterer, cluster_bounding_box, infer_type
 from .frame_utils import body_to_world_2d, quat_to_yaw, body_pose_to_base_link
 from .kf_tracker import GlobalKFTracker
 from .localization_input import LocalizationInput
+from .perception_core import LidarPerceptionCore, PerceptionParams, point_cloud_xyz
 
 
 class LidarTrackNode(Node):
@@ -94,6 +95,7 @@ class LidarTrackNode(Node):
         # 卡尔曼 + 关联
         self.declare_parameter('track_dt', 0.1)       # 控制周期（雷达 10Hz 时 0.1）
         self.declare_parameter('track_gate', 1.0)     # 匈牙利关联门限 m
+        self.declare_parameter('track_position_slack', 0.15)
         self.declare_parameter('track_lost_ttl', 10)  # 连续 miss 帧数 → 删除（10 帧≈1s）
         self.declare_parameter('kf_q', 0.3)           # 过程噪声
         self.declare_parameter('kf_r', 0.15)          # 观测噪声（聚类质心）
@@ -111,6 +113,11 @@ class LidarTrackNode(Node):
         self.declare_parameter('voxel_size',.08)
         self.declare_parameter('max_cluster_points',8000)
         self.declare_parameter('max_obstacle_range', 6.0)   # 只检测车周围 5m 内的障碍物
+        for name,default in {'ground_filter_enable':True,'ground_min_points':50,
+                             'obstacle_height_min':.12,'obstacle_height_max':2.2,
+                             'cluster_min_extent':.20,'structural_length':3.5,
+                             'structure_tile_size':1.2,'sensor_x':0.,'sensor_y':0.,'sensor_yaw':0.}.items():
+            self.declare_parameter(name,default)
 
         self._points_topic = str(self.get_parameter('points_topic').value)
         self._odom_topic = str(self.get_parameter('odom_topic').value)
@@ -157,7 +164,27 @@ class LidarTrackNode(Node):
             static_speed_thr=float(self.get_parameter('static_speed_thr').value),
             static_hold_frames=int(self.get_parameter('static_hold_frames').value),
             static_small_thr=float(self.get_parameter('static_small_thr').value),
+            position_slack=float(self.get_parameter('track_position_slack').value),
         )
+        self._perception = LidarPerceptionCore(PerceptionParams(
+            vehicle_length=float(self.get_parameter('vehicle_length').value),
+            vehicle_width=float(self.get_parameter('vehicle_width').value),
+            vehicle_outside=float(self.get_parameter('vehicle_outside').value),
+            lidar_height=self._lidar_h,max_range=self._max_range,
+            x_min=self._pass_xmin if self._all_around else self._front_xmin,
+            x_max=self._pass_xmax if self._all_around else self._front_xmax,
+            y_min=self._pass_ymin,y_max=self._pass_ymax,z_min=self._pass_zmin,z_max=self._pass_zmax,
+            voxel_size=self._voxel,cluster_gate=self._clusterer.gate,
+            cluster_min_points=self._clusterer.min_points,max_cluster_points=self._max_cluster_points,
+            ground_enabled=bool(self.get_parameter('ground_filter_enable').value),
+            ground_min_points=int(self.get_parameter('ground_min_points').value),
+            height_min=float(self.get_parameter('obstacle_height_min').value),
+            height_max=float(self.get_parameter('obstacle_height_max').value),
+            cluster_min_extent=float(self.get_parameter('cluster_min_extent').value),
+            structural_length=float(self.get_parameter('structural_length').value),
+            structure_tile_size=float(self.get_parameter('structure_tile_size').value),
+            sensor_x=float(self.get_parameter('sensor_x').value),sensor_y=float(self.get_parameter('sensor_y').value),
+            sensor_yaw=float(self.get_parameter('sensor_yaw').value)))
 
         # ---------------- 状态 ----------------
         self._loc = None            # (x, y, yaw) 最近定位
@@ -251,46 +278,15 @@ class LidarTrackNode(Node):
         if self._pub_obs is None:
             return 'obstacle_message_unavailable'
 
-        # ① 第一级直通滤波 + ③ 车体多边形剔除 → cloud_arround（base_link 系全周围）
-        phase=time.monotonic();pts_arround = self._cloud_arround(msg)
-        self._perception_metrics.update(filtered_points=len(pts_arround),filter_duration_s=time.monotonic()-phase)
-        if not pts_arround:
+        phase=time.monotonic()
+        try:xyz=point_cloud_xyz(msg)
+        except (ValueError,TypeError,BufferError):return 'malformed_cloud'
+        dets_body,metrics=self._perception.process(xyz,stamp,pose=self._loc)
+        self._perception_metrics.update(metrics,filter_cluster_duration_s=time.monotonic()-phase)
+        if not metrics['valid']:return metrics['reason']
+        if not dets_body:
             self._publish_obstacles(self._tracker.step([],dt=max(.005,min(.5,self._cloud_dt))))
             return 'empty_cloud_predicted_tracks'
-
-        # ⑤ 第二级直通滤波 → cloud_front（base_link 系前方 0.6~3m），聚类用
-        pts_front = pts_arround if self._all_around else self._cloud_front(pts_arround)
-        # Preserve extremal points in each voxel so measured box corners are
-        # not shrunk by replacing them with arbitrary voxel centres.
-        cells={}
-        for x,y in pts_front:
-            if math.hypot(x,y)>self._max_range:continue
-            key=(math.floor(x/self._voxel),math.floor(y/self._voxel))
-            old=cells.get(key)
-            if old is None:cells[key]=[(x,y)]*4
-            else:
-                if x<old[0][0]:old[0]=(x,y)
-                if x>old[1][0]:old[1]=(x,y)
-                if y<old[2][1]:old[2]=(x,y)
-                if y>old[3][1]:old[3]=(x,y)
-        pts_front=list(dict.fromkeys(p for cell in cells.values() for p in cell))
-        self._perception_metrics['cluster_input_points']=len(pts_front)
-        if len(pts_front)>self._max_cluster_points:return 'cluster_capacity' # no fabricated empty scene; downstream expires
-
-        # ⑥ 距离聚类 → 检测物（base_link 系）
-        dets_body = []
-        phase=time.monotonic();clusters=self._clusterer.cluster(pts_front)
-        self._perception_metrics['cluster_count']=len(clusters)
-        for cl in clusters:
-            cx, cy, L, W, theta = cluster_bounding_box(cl)
-            # 距离过滤：只保留车周围 5m 内的障碍物
-            dist = math.sqrt(cx*cx + cy*cy)
-            if dist > self._max_range:
-                continue
-            otype = infer_type(L, W)
-            dets_body.append((cx, cy, otype, L, W, theta))
-
-        self._perception_metrics.update(detection_count=len(dets_body),cluster_duration_s=time.monotonic()-phase)
         # ⑦ 转到全局系（map），供全局匹配
         rx, ry, rth = self._loc
         dets_world = []
@@ -348,7 +344,7 @@ class LidarTrackNode(Node):
                     y = float(p[1])
                     z_rs = float(p[2])
                     # z 偏移：rslidar系 → base_link系（雷达安装高度）
-                    z_bl = z_rs - self._lidar_h
+                    z_bl = z_rs + self._lidar_h
                     # ① 第一级直通滤波
                     if not (self._pass_xmin <= x <= self._pass_xmax):
                         continue
@@ -384,7 +380,7 @@ class LidarTrackNode(Node):
             z_bl = 0.0
             if zoff is not None:
                 z_rs = float(struct_unpack_f(data, i + zoff))
-                z_bl = z_rs - self._lidar_h
+                z_bl = z_rs + self._lidar_h
             # ① 直通滤波
             if not (self._pass_xmin <= x <= self._pass_xmax):
                 continue

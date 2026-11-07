@@ -6,9 +6,10 @@ def _work(input_queue,output_queue,planner):
     while True:
         item=input_queue.get()
         if item is None:return
-        seq,stamp,robot,goal,obs,trap,steer,age,plan_dt=item
+        seq,stamp,robot,goal,obs,trap,steer,age,plan_dt,*actuator=item
         try:
             started=time.monotonic();planner.current_steer=steer;planner.obstacle_age=age
+            planner.current_acc,planner.current_steer_rate=actuator if actuator else (0.,0.)
             planner.params.dt=plan_dt
             result=planner.plan(robot,goal,obs,trap)
             packet=(seq,stamp,robot,goal,result,planner.reference,dict(planner.telemetry,worker_duration_s=time.monotonic()-started,worker_queue_delay_s=max(0.,started-stamp),sampled_control_dt_s=plan_dt,sampled_pose=[robot.x,robot.y,robot.theta],sampled_velocity=robot.v,sampled_steer=steer,sampled_obstacle_age_s=age))
@@ -31,7 +32,7 @@ class AsyncPlanner:
             if kind=='ready':self._ready=True
             else:self._pending=False;self._result=payload
         if self._ready and not self._pending and self._process.is_alive():
-            self._seq+=1;item=(self._seq,now,copy.copy(robot),tuple(goal),copy.deepcopy(obs),copy.deepcopy(trap),self.current_steer,self.obstacle_age,self.params.dt)
+            self._seq+=1;item=(self._seq,now,copy.copy(robot),tuple(goal),copy.deepcopy(obs),copy.deepcopy(trap),self.current_steer,self.obstacle_age,self.params.dt,getattr(self,'current_acc',0.),getattr(self,'current_steer_rate',0.))
             try:self._input.put_nowait(item);self._pending=True
             except queue.Full:pass
         self.reference=[]
@@ -41,12 +42,26 @@ class AsyncPlanner:
         err=(robot.theta-pose.theta+math.pi)%(2*math.pi)-math.pi
         age=now-stamp
         displacement=math.hypot(robot.x-pose.x,robot.y-pose.y)
+        # Legitimate progress on the checked prefix is not a localization jump.
+        # Restrict projections by elapsed time so a loop or a distant tail
+        # cannot make a displaced pose appear valid.
+        deviation=displacement;heading_error=err;progress_time=0.
+        for a,b in zip(reference,reference[1:]):
+            if len(a)<5 or len(b)<5 or a[4]>age+.15:break
+            dx,dy=b[0]-a[0],b[1]-a[1];length2=dx*dx+dy*dy
+            u=max(0.,min(1.,((robot.x-a[0])*dx+(robot.y-a[1])*dy)/max(length2,1e-12)))
+            if b[4]>a[4]:u=min(u,max(0.,(age+.15-a[4])/(b[4]-a[4])))
+            distance=math.hypot(robot.x-a[0]-u*dx,robot.y-a[1]-u*dy)
+            if distance<deviation:
+                deviation=distance;progress_time=a[4]+u*(b[4]-a[4])
+                yaw=a[2]+u*((b[2]-a[2]+math.pi)%(2*math.pi)-math.pi)
+                heading_error=(robot.theta-yaw+math.pi)%(2*math.pi)-math.pi
         stale_causes=[]
         if old_goal!=tuple(goal):stale_causes.append('goal_changed')
         if age>self.max_age+1e-6:stale_causes.append('result_age')
-        if displacement>.18:stale_causes.append('pose_displacement')
-        if abs(err)>math.radians(12):stale_causes.append('yaw_change')
-        details=dict(telemetry,worker_reason=telemetry.get('reason'),result_age_s=age,max_result_age_s=self.max_age,sequence=seq,goal_changed=old_goal!=tuple(goal),pose_displacement_m=displacement,yaw_change_rad=err,pending=self._pending,stale_causes=stale_causes)
+        if deviation>.18:stale_causes.append('pose_displacement')
+        if abs(heading_error)>math.radians(12):stale_causes.append('yaw_change')
+        details=dict(telemetry,worker_reason=telemetry.get('reason'),result_age_s=age,max_result_age_s=self.max_age,sequence=seq,goal_changed=old_goal!=tuple(goal),pose_displacement_m=displacement,yaw_change_rad=err,path_deviation_m=deviation,path_heading_error_rad=heading_error,path_progress_time_s=progress_time,pending=self._pending,stale_causes=stale_causes)
         if stale_causes:
             self.telemetry=dict(details,reason='planning_result_stale');return False,0.,0.
         self.reference=reference;self.telemetry=details

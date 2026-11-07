@@ -180,11 +180,12 @@ class RealVehicleBridgeNode(Node):
         self.declare_parameter('gps_yaw_topic', '')           # 可选：std_msgs/Float32 航向(rad)
         self.declare_parameter('gps_yaw_use_diff', True)      # 无航向话题时用 GPS 位移差分估航向
 
-        for key,default in {'planning_budget_s':.25,'safety_margin':.12,'heading_weight':.3,'steer_weight':.12,'steer_change_weight':.08,'guide_extra':.08,'command_acc':.7,'command_steer_rate_deg':30.,'near_goal_spin_distance':4.,'near_goal_spin_angle_deg':65.,'blocked_spin_time':1.2,'spin_speed':.6,'cruise_velocity':1.,'lateral_acc_max':.6,'goal_replay_epsilon':.05,'motion_stall_time':3.,'recovery_subgoal_distance':1.8,'recovery_max_retries':2,'goal_max_spin_requests':4}.items():
+        for key,default in {'planning_budget_s':.25,'safety_margin':.12,'heading_weight':.3,'steer_weight':.12,'steer_change_weight':.08,'guide_extra':.08,'command_acc':.7,'command_dec':1.2,'command_jerk':2.,'command_steer_accel_deg':100.,'actuator_delay_s':.1,'command_steer_rate_deg':30.,'near_goal_spin_distance':4.,'near_goal_spin_angle_deg':65.,'blocked_spin_time':1.2,'spin_speed':.6,'cruise_velocity':1.,'lateral_acc_max':.6,'goal_replay_epsilon':.05,'motion_stall_time':3.,'recovery_subgoal_distance':1.8,'recovery_max_retries':2,'goal_max_spin_requests':4}.items():
             self.declare_parameter(key,default)
         self.declare_parameter('async_planning', True)
         self.declare_parameter('planning_result_max_age_s', .8)
         self.declare_parameter('velocity_horizon_targets',True)
+        self.declare_parameter('staged_avoidance',True)
         cfg = BridgeConfig()
         cfg.algorithm_frame = self.get_parameter('algorithm_frame').value
         cfg.body_frames = list(self.get_parameter('body_frames').value)
@@ -292,8 +293,10 @@ class RealVehicleBridgeNode(Node):
                                   fws_params=fws)
             self.get_logger().info(
                 f'[4WIS 回退] kinematics_mode={kinematics_mode}（原地自转仍可用）')
-        for key in ['planning_budget_s','safety_margin','heading_weight','steer_weight','steer_change_weight','guide_extra','command_acc','cruise_velocity','lateral_acc_max']:
+        for key in ['planning_budget_s','safety_margin','heading_weight','steer_weight','steer_change_weight','guide_extra','command_acc','command_dec','command_jerk','actuator_delay_s','cruise_velocity','lateral_acc_max']:
             setattr(pp,key,float(self.get_parameter(key).value))
+        pp.command_steer_accel=math.radians(float(self.get_parameter('command_steer_accel_deg').value))
+        pp.staged_avoidance=bool(self.get_parameter('staged_avoidance').value)
         pp.velocity_horizon_targets=bool(self.get_parameter('velocity_horizon_targets').value)
         for key in ['near_goal_spin_distance','near_goal_spin_angle_deg','blocked_spin_time','spin_speed','command_acc','command_steer_rate_deg','safety_margin','goal_replay_epsilon','motion_stall_time','recovery_subgoal_distance','recovery_max_retries','goal_max_spin_requests']:
             setattr(cfg,key,self.get_parameter(key).value)
@@ -704,7 +707,8 @@ class RealVehicleBridgeNode(Node):
         path = Path()
         path.header.frame_id = 'map'
         path.header.stamp = now_msg
-        for (px, py, pth, pv, pt) in rb:
+        for point in rb:
+            px,py,pth,pv,pt=point[:5]
             ps = PoseStamped()
             tt = t0 + float(pt)
             ps.header.frame_id = 'map'

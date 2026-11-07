@@ -3,7 +3,7 @@
 # Safety margin is separate from physical dimensions. Parameters validated offline; see docs/implementation/20261107.
 rda_dwa_real_bridge:
   ros__parameters:
-    localization_source: latest_topic
+    localization_source: latest_available
     localization_parent_frame: map
     localization_child_frame: body
     algorithm_frame: map
@@ -111,6 +111,11 @@ rda_dwa_real_bridge:
     steer_weight: 0.4
     steer_change_weight: 0.12
     command_acc: 0.7
+    command_dec: 1.2
+    command_jerk: 2.0
+    command_steer_accel_deg: 100.0
+    actuator_delay_s: 0.1
+    staged_avoidance: true
     command_steer_rate_deg: 30.0
     near_goal_spin_distance: 3.5
     near_goal_spin_angle_deg: 75.0
@@ -145,7 +150,7 @@ control_bridge_node:
     bridge_state_topic: /car_bridge_state
 traj_tracker_node:
   ros__parameters:
-    localization_source: latest_topic
+    localization_source: latest_available
     localization_parent_frame: map
     localization_child_frame: body
     wheelbase: 0.69
@@ -223,12 +228,12 @@ traj_tracker_node:
     obstacle_timeout: 0.4
     safety_margin: 0.12
     use_atomic_plan: true
-    speed_preview_distance: 0.25
+    speed_preview_distance: 0.0
     lateral_acc_max: 0.6
     stop_window_s: 1.0
 lidar_track_node:
   ros__parameters:
-    localization_source: latest_topic
+    localization_source: latest_available
     localization_parent_frame: map
     localization_child_frame: body
     vehicle_length: 1.2
@@ -239,17 +244,25 @@ lidar_track_node:
     body_to_base_link_x: 0.0
     front_x_min: 0.2
     front_x_max: 4.0
-    max_obstacle_range: 6.0
+    max_obstacle_range: 8.0
     track_all_around: true
-    voxel_size: 0.08
+    voxel_size: 0.10
     max_cluster_points: 8000
-    pass_y_min: -6.0
-    pass_y_max: 6.0
-    cluster_gate: 0.6
-    cluster_min_points: 2
+    pass_y_min: -8.0
+    pass_y_max: 8.0
+    cluster_gate: 0.30
+    cluster_min_points: 10
+    cluster_min_extent: 0.20
+    ground_filter_enable: true
+    ground_min_points: 50
+    obstacle_height_min: 0.12
+    obstacle_height_max: 2.2
+    structural_length: 3.5
+    structure_tile_size: 1.2
     cluster_max_radius: 30.0
     track_dt: 0.05
     track_gate: 1.0
+    track_position_slack: 0.15
     track_lost_ttl: 10
     kf_q: 0.3
     kf_r: 0.15

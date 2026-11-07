@@ -195,7 +195,8 @@ class TrajTrackerNode(Node):
         self.get_logger().info(f"[DIAG] MODE->{mode} t={t:.3f}")
 
     def _on_clear(self, reason: str):
-        self.get_logger().info(f"[DIAG] CLEAR_PATH reason={reason}")
+        self.get_logger().info(
+            f"[DIAG] CLEAR_PATH reason={reason} planner_reason={getattr(self, '_last_plan_reason', 'no_plan')}")
 
     def _cb_plan(self,msg):
         if not self._atomic:return
@@ -206,7 +207,7 @@ class TrajTrackerNode(Node):
             if mode not in (0,1) or not math.isfinite(target):raise ValueError('plan fields')
             reason=str(p['reason']);self._last_plan_reason=reason
             self._last_plan_stamp=stamp;self._last_cmd_ts=now;self._spin_target=target
-            healthy=reason in ('motion','spin_requested','spin_active','spin_reached','reached','mode_return_wait')
+            healthy=reason in ('motion','goal_braking','dynamic_braking','dynamic_wait','spin_requested','spin_active','spin_reached','reached','mode_return_wait')
             self.core.set_safety('' if healthy else reason)
             self.core.set_traj_mode(mode,now,session,target)
             if mode==0:
@@ -245,7 +246,7 @@ class TrajTrackerNode(Node):
         elif now-self.core._pose_at>self.core.p.localization_timeout:reason='localization_timeout'
         elif now-self.core._obstacle_at>self.core.p.obstacle_timeout:reason='obstacle_timeout'
         if reason:self.core.set_safety(reason)
-        elif self._last_plan_reason in ('motion','spin_requested','spin_active','spin_reached','reached','mode_return_wait') and self.core._safety_reason not in ('invalid_localization','localization_jump'):
+        elif self._last_plan_reason in ('motion','goal_braking','dynamic_braking','dynamic_wait','spin_requested','spin_active','spin_reached','reached','mode_return_wait') and self.core._safety_reason not in ('invalid_localization','localization_jump'):
             self.core.set_safety('')
         cmd=self.core.step(now,dt,self._spin_target)
         self._publish(cmd)

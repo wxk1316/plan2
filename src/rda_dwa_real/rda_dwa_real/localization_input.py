@@ -4,6 +4,8 @@ latest_topic caches the most recently received valid pose. Its ROS header is
 diagnostic data; a monotonic receipt time drives the disconnect watchdog and
 the core update clock. Re-reading the cache cannot renew that receipt time.
 The original source-time topic and TF modes remain explicit alternatives.
+latest_available selects the newer valid existing TF/topic output; all core
+updates use a monotonic clock and cached samples cannot renew the watchdog.
 """
 import math
 import time
@@ -20,19 +22,21 @@ class LocalizationInput:
         self.source = str(node.get_parameter('localization_source').value)
         self.parent = str(node.get_parameter('localization_parent_frame').value)
         self.child = str(node.get_parameter('localization_child_frame').value)
-        if self.source not in ('topic', 'tf', 'latest_topic'):
-            raise ValueError('localization_source must be topic, tf, or latest_topic')
+        if self.source not in ('topic', 'tf', 'latest_topic','latest_available'):
+            raise ValueError('localization_source must be topic, tf, latest_topic, or latest_available')
         if not self.parent or not self.child or self.parent == self.child:
             raise ValueError('localization TF needs two different, nonempty frames')
         self.reason = dict(topic='topic', tf='tf_waiting',
-                           latest_topic='latest_topic_waiting')[self.source]
+                           latest_topic='latest_topic_waiting',latest_available='latest_available_waiting')[self.source]
         self.stamp = None
         self.age = None
         self._pose = None
         self._received_at = None
         self.receive_age = None
         self.effective_stamp = None
-        if self.source == 'tf':
+        self.selected_source=self.source
+        self._last_tf_stamp=None;self._tf_effective_stamp=None;self._topic_stamp=None
+        if self.source in ('tf','latest_available'):
             from rclpy.time import Time
             from tf2_ros import Buffer, TransformListener, TransformException
             self._time = Time
@@ -48,7 +52,7 @@ class LocalizationInput:
 
     @property
     def uses_latest_topic(self):
-        return self.source == 'latest_topic'
+        return self.source in ('latest_topic','latest_available')
 
     def receive_topic(self, pose, header, received_at=None):
         """Cache a valid body pose on message arrival, including old headers."""
@@ -67,7 +71,8 @@ class LocalizationInput:
             return False
         self._pose = (p.x, p.y, quat_to_yaw(q.x, q.y, q.z, q.w))
         self._received_at = now
-        self.stamp = header.stamp.sec + header.stamp.nanosec * 1e-9
+        self._topic_stamp=header.stamp.sec + header.stamp.nanosec * 1e-9
+        if self.selected_source!='tf':self.stamp=self._topic_stamp
         self.reason = 'latest_topic_valid'
         return True
 
@@ -77,12 +82,26 @@ class LocalizationInput:
         latest_topic uses receipt time, allowing delayed, duplicate, and
         irregular ROS headers. TF mode still uses TF's latest common time.
         """
+        now=time.monotonic() if now is None else now
+        if self.source=='latest_available':
+            sample=self._sample_tf(max_age)
+            # Choose source time when comparable. Delayed topic headers do
+            # not suppress a newer existing map->body transform.
+            if sample is not None and (self._topic_stamp is None or sample[1]>=self._topic_stamp):
+                pose,stamp,age=sample
+                if stamp!=self._last_tf_stamp:
+                    self._last_tf_stamp=stamp;self._tf_effective_stamp=now-age
+                self.selected_source='tf';self.effective_stamp=self._tf_effective_stamp
+                self.receive_age=max(0.,now-self.effective_stamp)
+                self.reason='latest_tf_valid'
+                return pose,self.effective_stamp,self.receive_age
         if self.uses_latest_topic:
             if self._received_at is None:
                 self.reason = 'latest_topic_waiting'
                 return None
             now = time.monotonic() if now is None else now
             self.receive_age = max(0., now-self._received_at)
+            self.selected_source='latest_topic';self.stamp=self._topic_stamp
             self.age = self.node.get_clock().now().nanoseconds * 1e-9 - self.stamp
             self.effective_stamp = self._received_at
             if self.receive_age > max_age:
@@ -92,6 +111,9 @@ class LocalizationInput:
             return self._pose, self._received_at, self.receive_age
         if not self.uses_tf:
             return None
+        return self._sample_tf(max_age)
+
+    def _sample_tf(self,max_age):
         try:
             transform = self.buffer.lookup_transform(
                 self.parent, self.child, self._time())
@@ -118,6 +140,7 @@ class LocalizationInput:
     def diagnostic(self):
         return dict(source=self.source, parent_frame=self.parent,
                     child_frame=self.child, reason=self.reason,
+                    selected_source=self.selected_source,
                     source_stamp=self.stamp, source_age_s=self.age,
                     receive_age_s=self.receive_age,
                     effective_pose_stamp=self.effective_stamp,
