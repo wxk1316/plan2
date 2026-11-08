@@ -226,9 +226,9 @@ class TrajTrackerNode(Node):
             typ=str(o.type);speed=max(0.,float(o.speed))
             if not all(math.isfinite(float(v)) for v in (o.x,o.y,o.length,o.width,o.heading,o.speed)) or o.length<=0 or o.width<=0:
                 self.core._obstacle_at=-1e9;self.core.set_safety('invalid_obstacle');return
-            if typ.startswith('static') or typ=='block':speed=0.
+            if typ.startswith('static') or typ in ('block','unknown'):speed=0.
             obs.append(TrackedObstacle(float(o.x),float(o.y),float(o.length),float(o.width),float(o.shape_heading) if getattr(o,'has_shape_heading',False) else float(o.heading),
-                       speed*math.cos(o.heading),speed*math.sin(o.heading),int(o.id),typ=='unknown',1.5 if typ=='unknown' else 0.))
+                       speed*math.cos(o.heading),speed*math.sin(o.heading),int(o.id),typ=='unknown',0.))
         source=msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9
         age=max(0.,self.get_clock().now().nanoseconds*1e-9-source)
         self.core.set_obstacles(obs,now-age,stamp=source)

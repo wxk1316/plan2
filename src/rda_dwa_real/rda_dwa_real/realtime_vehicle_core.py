@@ -7,7 +7,7 @@ import math,time
 import numpy as np
 from .pose_velocity import PoseVelocityEstimator
 from .vehicle_bridge import VehicleBridgeCore
-from rda_dwa.motion_safety import VehicleGeometry,TrackedObstacle,rollout_rear,to_centres,minimum_gaps,spin_is_safe,unknown_command_gap
+from rda_dwa.motion_safety import VehicleGeometry,TrackedObstacle,rollout_rear,to_centres,minimum_gaps,spin_is_safe
 
 class RealtimeVehicleBridgeCore(VehicleBridgeCore):
     def __init__(self,*args,**kwargs):
@@ -67,9 +67,9 @@ class RealtimeVehicleBridgeCore(VehicleBridgeCore):
             x,y,typ,length,width,heading,speed=d[:7];ident=int(d[7]) if len(d)>7 and d[7] is not None else len(objects)
             if not all(math.isfinite(float(v)) for v in (x,y,length,width,heading,speed)) or length<=0 or width<=0:
                 self._t_obs=-1e9;return
-            if typ.startswith('static') or typ=='block':speed=0.
+            if typ.startswith('static') or typ in ('block','unknown'):speed=0.
             shape=d[8] if len(d)>8 else heading
-            objects.append(TrackedObstacle(x,y,length,width,shape,speed*math.cos(heading),speed*math.sin(heading),ident,typ=='unknown',self.cfg.obstacle_max_speed if typ=='unknown' else 0.))
+            objects.append(TrackedObstacle(x,y,length,width,shape,speed*math.cos(heading),speed*math.sin(heading),ident,typ=='unknown',0.))
         self._last_received_obs=objects
     def set_wheel_feedback(self,speeds,stamp=None):
         if len(speeds)==4 and all(math.isfinite(float(v)) for v in speeds):
@@ -93,11 +93,7 @@ class RealtimeVehicleBridgeCore(VehicleBridgeCore):
         horizon=max(.8,max(self._v_meas,0.)/1.2+.6)
         rear,_,times=rollout_rear(self.robot.x,self.robot.y,self.robot.theta,max(0.,self._v_meas),self._tracker_angle,[v],[delta],self.geometry,horizon,.05,acc=getattr(self.cfg,'command_acc',.7),steer_rate=math.radians(getattr(self.cfg,'command_steer_rate_deg',30.)),jerk=2.,steer_accel=math.radians(100),initial_acc=self._tracker_acc,initial_steer_rate=self._tracker_steer_rate,delay=.1)
         bound=(max(v,self._v_meas,0.)+abs(w)*self.geometry.radius)*.025
-        known=[o for o in obs if not o.uncertain];unknown=[o for o in obs if o.uncertain]
-        gap=float(minimum_gaps(to_centres(rear,self.geometry),times,known,self.geometry,age,bound)[0])
-        if unknown:
-            gap=min(gap,float(minimum_gaps(to_centres(rear,self.geometry),times,unknown,self.geometry,age,bound,valid_until=.4)[0]),
-                    unknown_command_gap(self.robot.x,self.robot.y,self.robot.theta,max(0.,self._v_meas),self._tracker_angle,v,delta,unknown,self.geometry,age,self._tracker_acc,self._tracker_steer_rate))
+        gap=float(minimum_gaps(to_centres(rear,self.geometry),times,obs,self.geometry,age,bound)[0])
         return gap>=getattr(self.cfg,'safety_margin',.12)
     def _finish(self,info,reason,v=0.,w=0.,road=()):
         if self._clear_traj_pending:self._clear_traj_seq+=1;self._clear_traj_pending=False

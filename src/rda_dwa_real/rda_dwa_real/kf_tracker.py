@@ -3,7 +3,7 @@ kf_tracker.py — 全局坐标系障碍物跟踪器（卡尔曼滤波 + 匈牙�
 
 用途：
   为激光雷达聚类得到的"无 id"障碍物赋予跨帧稳定 id，输出平滑的位置/速度，
-  供 RL-DWA 实车适配层（bridge_node → TrackManager → IMM predictor）消费。
+  供实时 Ackermann 规划器消费：unknown 输出固定实测框，已确认运动物体输出 CV 速度。
 
 设计口径（与用户确认）：
   - 坐标系：全局系（algorithm_frame='map'）。检测物由调用方先从车体系转到全局系。
@@ -81,6 +81,8 @@ class KFTrack:
         self.obs_type = obs_type
         self.length = float(length)
         self.width = float(width)
+        self.measured_length = float(length)
+        self.measured_width = float(width)
         self.shape_heading=None
         # 动态/静态判定（滞回）：初始输出 unknown
         self.moving = False
@@ -322,7 +324,8 @@ class GlobalKFTracker:
     # ------------------------------------------------------------------
     def _refresh_attr(self, tr: KFTrack, det) -> None:
         """匹配帧刷新属性：静态类型航向冻结由输出层处理；类型/尺寸随当前几何观测刷新。"""
-        tr.length=float(det[3]);tr.width=float(det[4]);tr.obs_type=det[2]
+        tr.measured_length=float(det[3]);tr.measured_width=float(det[4])
+        tr.length=tr.measured_length;tr.width=tr.measured_width;tr.obs_type=det[2]
         if len(det)>5:tr.shape_heading=float(det[5])
         # Enclose the latest measured box around the filtered position, whose
         # lag can otherwise shave a corner off an observed vehicle.
@@ -339,7 +342,8 @@ class GlobalKFTracker:
         """输出 [(id, x, y, speed, heading, otype, L, W)]，按 id 升序。
 
         类型由运动性判定决策；检测名称仅表示尺寸提示：
-          - moving=True → 保留 pedestrian/bicycle/vehicle 尺寸提示，输出 KF 速度
+          - 未确认或漏检动态目标 → unknown，最新实测位置/尺寸、速度 0
+          - moving=True 且本帧匹配 → 保留 pedestrian/bicycle/vehicle 尺寸提示，输出 KF 速度
           - moving=False → 静态：长边 ≤ static_small_thr → 'block'，否则 'static_large'
             （速度 0，框的真实方向仍通过 shape_heading 保留）
         """
@@ -358,15 +362,15 @@ class GlobalKFTracker:
                     else 'static_large'
             # Keep a measured, confirmed static obstacle through the existing
             # short miss TTL. Missing it for one scan does not prove motion.
-            # Unconfirmed/moving missed tracks retain the unknown protection.
+            # A missed mover returns to the requested stationary unknown policy.
             if t.miss and (t.moving or t._st_cnt<self.static_hold_frames):otype='unknown'
             length,width=t.length,t.width
             if otype=='unknown':
                 x,y=t.last_measurement
-                # ObstacleArray is stamped with the current cloud. Account for
-                # age since this track's last observation in its present box.
-                padding=2.*t.max_speed*t.measurement_age
-                length+=padding;width+=padding
+                # Fixed latest measured box: no speed*age expansion, and no
+                # filtered-centre enclosure padding at a measured centre.
+                # Internal KF prediction still runs for association/confirmation.
+                length,width=t.measured_length,t.measured_width
                 sp,hd=0.,0.
             row=(tid,x,y,sp,hd,otype,length,width)
             out.append(row+(t.shape_heading,) if t.shape_heading is not None else row)

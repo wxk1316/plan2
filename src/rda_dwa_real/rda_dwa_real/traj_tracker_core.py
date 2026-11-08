@@ -1,9 +1,9 @@
 """Rear-axle geometric LQR tracking and latched body-centre spin sessions.
 
-References preserve the planner's bounded actuator forecast. Known occupancy
-uses its long forecast; unknown occupancy uses action and braking checks with
-fresh observations at execution. No old tail or independent x/y/yaw splines
-alter that geometry.
+References preserve the planner's bounded actuator forecast. Unknown boxes
+remain stationary; confirmed moving actors translate at every prediction time.
+Execution rechecks fresh observations over its full short horizon. No old tail
+or independent x/y/yaw splines alter that geometry.
 Localization input is the geometric centre; the conversion stays internal.
 """
 import math
@@ -11,7 +11,7 @@ from collections import deque
 import numpy as np
 from .adaptive_preview import AdaptivePreview
 from .pose_velocity import PoseVelocityEstimator
-from rda_dwa.motion_safety import VehicleGeometry,rollout_rear,to_centres,minimum_gaps,steering_step,speed_step,unknown_command_gap
+from rda_dwa.motion_safety import VehicleGeometry,rollout_rear,to_centres,minimum_gaps,steering_step,speed_step
 
 def wrap_angle(a):return (float(a)+math.pi)%(2*math.pi)-math.pi
 
@@ -234,12 +234,7 @@ class TrajTrackerCore:
         if now-self._obstacle_at<=self.p.obstacle_timeout:
             rear,_,tt=rollout_rear(self._px,self._py,self._pyaw,max(0.,self._v_meas),self._last_steer,[v],[delta],self.geometry,max(.8,max(self._v_meas,0.)/self.p.dec_max+.6),.05,dec=self.p.dec_max,steer_rate=math.radians(self.p.max_steer_rate_deg),jerk=self.p.jerk_max,steer_accel=math.radians(self.p.max_steer_accel_deg),initial_acc=self._acc,initial_steer_rate=self._steer_rate,delay=.1)
             bound=(max(v,self._v_meas,0.)+abs(v*math.tan(delta)/self.p.wheelbase)*self.geometry.radius)*.025
-            known=[o for o in self._obstacles if not o.uncertain];unknown=[o for o in self._obstacles if o.uncertain]
-            execution_gap=float(minimum_gaps(to_centres(rear,self.geometry),tt,known,self.geometry,now-self._obstacle_at,bound)[0])
-            if unknown:
-                prefix=float(minimum_gaps(to_centres(rear,self.geometry),tt,unknown,self.geometry,now-self._obstacle_at,bound,valid_until=.4)[0])
-                braking=unknown_command_gap(self._px,self._py,self._pyaw,max(0.,self._v_meas),self._last_steer,v,delta,unknown,self.geometry,now-self._obstacle_at,self._acc,self._steer_rate)
-                execution_gap=min(execution_gap,prefix,braking)
+            execution_gap=float(minimum_gaps(to_centres(rear,self.geometry),tt,self._obstacles,self.geometry,now-self._obstacle_at,bound)[0])
             if execution_gap<self.p.safety_margin:
                 self._diag={'branch':'EXECUTION_GUARD','min_predicted_gap':execution_gap,'required_margin':self.p.safety_margin,'preview':preview_diag,'obstacle_age_s':now-self._obstacle_at};return self.stop_cmd()
         self._diag={'branch':'LQR','preview':preview_diag,'speed_preview_distance_m':self.p.speed_preview_distance,'min_predicted_gap':execution_gap,'required_margin':self.p.safety_margin,'e_y':ey,'e_th':eth,'kappa_ref':look[4],'delta_ff':ff,'correction':corr,'v_ref':cap,'v_out':v,'s':s,'ahead':self.ref_ahead()}
