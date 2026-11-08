@@ -51,12 +51,12 @@ rda_dwa_real_bridge:
     wheel_feedback_timeout: 0.3
     car_state_topic: /car_state
     bridge_state_topic: /car_bridge_state
-    obstacle_max_speed: 1.5
+    obstacle_max_speed: 1.0
     cluster_gate: 0.6
     cluster_min_points: 2
     cluster_max_radius: 30.0
-    track_gate: 1.0
-    track_lost_ttl: 5
+    track_gate: 0.5
+    track_lost_ttl: 3
     vehicle_length: 1.2
     vehicle_width: 0.8
     v_max: 1.0
@@ -255,7 +255,7 @@ lidar_track_node:
     pass_y_max: 8.0
     cluster_gate: 0.30
     cluster_min_points: 10
-    cluster_min_extent: 0.20
+    cluster_min_extent: 0.15
     ground_filter_enable: true
     ground_min_points: 50
     obstacle_height_min: 0.12
@@ -264,12 +264,14 @@ lidar_track_node:
     structure_tile_size: 1.2
     cluster_max_radius: 30.0
     track_dt: 0.05
-    track_gate: 1.0
+    track_gate: 0.5
     track_position_slack: 0.15
-    track_lost_ttl: 10
+    track_size_weight: 0.5
+    track_shape_slack_max: 0.35
+    track_lost_ttl: 3
     kf_q: 0.3
     kf_r: 0.15
-    obstacle_max_speed: 1.5
+    obstacle_max_speed: 1.0
     dyn_speed_thr: 0.3
     dyn_hold_frames: 5
     static_speed_thr: 0.15

@@ -60,7 +60,7 @@ class PerceptionParams:
     voxel_size: float=.10
     cluster_gate: float=.30
     cluster_min_points: int=10
-    cluster_min_extent: float=.20
+    cluster_min_extent: float=.15
     max_cluster_points: int=8000
     structural_length: float=3.5
     structure_tile_size: float=1.2

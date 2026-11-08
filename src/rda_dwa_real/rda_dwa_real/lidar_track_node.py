@@ -98,12 +98,14 @@ class LidarTrackNode(Node):
         self.declare_parameter('cluster_max_radius', 30.0)
         # 卡尔曼 + 关联
         self.declare_parameter('track_dt', 0.1)       # 控制周期（雷达 10Hz 时 0.1）
-        self.declare_parameter('track_gate', 1.0)     # 匈牙利关联门限 m
+        self.declare_parameter('track_gate', 0.5)     # 匈牙利关联门限 m
         self.declare_parameter('track_position_slack', 0.15)
-        self.declare_parameter('track_lost_ttl', 10)  # 连续 miss 帧数 → 删除（10 帧≈1s）
+        self.declare_parameter('track_size_weight', 0.5)
+        self.declare_parameter('track_shape_slack_max', 0.35)
+        self.declare_parameter('track_lost_ttl', 3)  # 第3个连续未匹配的已处理帧删除
         self.declare_parameter('kf_q', 0.3)           # 过程噪声
         self.declare_parameter('kf_r', 0.15)          # 观测噪声（聚类质心）
-        self.declare_parameter('obstacle_max_speed', 1.5)
+        self.declare_parameter('obstacle_max_speed', 1.0)
         # 动态/静态运动判别（用户场景：动态障碍只有行人，其余车道路障均为静态）
         # 阈值须高于 CV 卡尔曼对静止障碍的稳态速度噪声（实测默认 0.3/0.15，滞回带 0.15~0.3）
         self.declare_parameter('dyn_speed_thr', 0.3)       # KF 速度>此值 → "在动"
@@ -119,7 +121,7 @@ class LidarTrackNode(Node):
         self.declare_parameter('max_obstacle_range', 6.0)   # 只检测车周围 5m 内的障碍物
         for name,default in {'ground_filter_enable':True,'ground_min_points':50,
                              'obstacle_height_min':.12,'obstacle_height_max':2.2,
-                             'cluster_min_extent':.20,'structural_length':3.5,
+                             'cluster_min_extent':.15,'structural_length':3.5,
                              'structure_tile_size':1.2,'sensor_x':0.,'sensor_y':0.,'sensor_yaw':0.}.items():
             self.declare_parameter(name,default)
 
@@ -169,6 +171,8 @@ class LidarTrackNode(Node):
             static_hold_frames=int(self.get_parameter('static_hold_frames').value),
             static_small_thr=float(self.get_parameter('static_small_thr').value),
             position_slack=float(self.get_parameter('track_position_slack').value),
+            size_weight=float(self.get_parameter('track_size_weight').value),
+            shape_slack_max=float(self.get_parameter('track_shape_slack_max').value),
         )
         self._perception = LidarPerceptionCore(PerceptionParams(
             vehicle_length=float(self.get_parameter('vehicle_length').value),
@@ -228,6 +232,7 @@ class LidarTrackNode(Node):
             f'lidar_track_node 启动: points={self._points_topic} '
             f'odom={self._odom_topic} → {self._obstacles_topic} '
             f'cluster_gate={self._clusterer.gate} track_gate={self._tracker.gate} '
+            f'track_max_speed={self._tracker.max_speed} size_weight={self._tracker._matcher.size_weight} lost_ttl={self._tracker.lost_ttl} '
             f'async_perception={self._async_enabled} max_source_age={self._max_source_age:.2f}s '
             f'track_reset_gap={self._track_reset_gap:.2f}s')
 

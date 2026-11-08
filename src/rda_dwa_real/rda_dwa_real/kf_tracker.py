@@ -9,11 +9,11 @@ kf_tracker.py — 全局坐标系障碍物跟踪器（卡尔曼滤波 + 匈牙�
   - 坐标系：全局系（algorithm_frame='map'）。检测物由调用方先从车体系转到全局系。
   - 运动模型：CV（匀速）卡尔曼滤波，状态 [x, y, vx, vy]^T，dt 步进。
   - 数据关联：匈牙利最小成本匹配（scipy.optimize.linear_sum_assignment，开源标准库），
-    成本 = 预测位置与检测位置欧氏距离，超过关联门限 gate 的置不可匹配；
+    成本 = 预测中心距离 + 尺寸差异加权；距离受实际时间可达界和 gate 双重限制；
     无 scipy 时回退贪心最近邻（按成本升序逐一锁定）。
   - track 生命周期：匹配 → KF 更新；未匹配检测 → 新建；连续 miss >= lost_ttl → 删除。
   - 类型/尺寸：每次匹配刷新观测框并保守包含最新观测；
-    运动类别由真实观测滞回确认，未确认/丢失动态目标保持 unknown。
+    运动类别由真实观测确认；未确认目标静止输出，已确认动态漏检保持类别并用 KF 预测。
 
 依赖：仅 numpy（+ 可选 scipy）。不依赖 ROS，Windows/WSL 均可单测。
 """
@@ -47,7 +47,7 @@ class KFTrack:
                  q: float = 0.3, r: float = 0.15,
                  obs_type: str = 'unknown',
                  length: float = 1.0, width: float = 1.0,
-                 max_speed: float = 1.5,
+                 max_speed: float = 1.0,
                  dyn_speed_thr: float = 0.3,
                  dyn_hold_frames: int = 5,
                  static_speed_thr: float = 0.15,
@@ -89,6 +89,7 @@ class KFTrack:
         self._mv_cnt = 0
         self._st_cnt = 0
         self.last_measurement = (float(x), float(y))
+        self.last_filtered_position = (float(x), float(y))
         self.measurement_age = 0.0
 
     # ------------------------------------------------------------------
@@ -112,6 +113,11 @@ class KFTrack:
         self.x = self.x + K @ (z - self.H @ self.x)
         I_KH = np.eye(4) - K @ self.H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T  # Joseph 形式（数值稳定）
+        # Keep the CV state and published velocity within the scene speed bound.
+        speed = math.hypot(self.x[2], self.x[3])
+        if speed > self.max_speed:
+            self.x[2:4] *= self.max_speed / speed
+        self.last_filtered_position = self.position()
         self.miss = 0
 
     # ------------------------------------------------------------------
@@ -154,54 +160,50 @@ class KFTrack:
 # 匈牙利匹配
 # ---------------------------------------------------------------------------
 class HungarianMatcher:
-    """检测物 ↔ 已有 track 的最小成本匹配。
+    """中心距离与实测尺寸联合匹配；可达性门限独立于加权成本。"""
 
-    成本 = 预测位置与检测位置欧氏距离；超过 gate 的项置 INF 不可匹配。
-    scipy 可用时用匈牙利最优解；否则贪心最近邻（按成本升序逐一锁定）。
-    """
-
-    def __init__(self, gate: float = 1.0):
+    def __init__(self, gate: float = 0.5, size_weight: float = 0.5):
         self.gate = float(gate)
+        self.size_weight = float(size_weight)
+        if not math.isfinite(self.gate) or self.gate <= 0 or not math.isfinite(self.size_weight) or self.size_weight < 0:
+            raise ValueError('invalid association gate or size weight')
 
-    def match(self, pred: list, dets: list, last_measured=None, max_displacements=None,shape_slack=None) -> tuple:
-        """pred: [(px, py)] 预测位置；dets: [(dx, dy)] 检测位置。
+    def match(self, pred: list, dets: list, last_measured=None,
+              max_displacements=None, shape_slack=None, size_differences=None) -> tuple:
+        """Return matched index pairs and unmatched detections.
 
-        返回 (matched, unmatched_det_idx)：
-          matched: [(track_idx, det_idx)]，cost 均 <= gate
-          unmatched_det_idx: 未匹配的检测下标
+        Last-measured-centre reachability uses elapsed source time; the
+        predicted-centre residual has a separate fixed metre cap. Sizes
+        affect assignment cost, never the validity test on that weighted cost.
         """
-        n = len(pred)
-        m = len(dets)
+        n, m = len(pred), len(dets)
         if n == 0 or m == 0:
             return [], list(range(m))
-        cost = np.full((n, m), 1e6, dtype=np.float64)
+        cost = np.full((n, m), 1e9, dtype=np.float64)
+        allowed = np.zeros((n, m), dtype=bool)
         for i, (px, py) in enumerate(pred):
             for j, (dx, dy) in enumerate(dets):
-                d = math.hypot(px - dx, py - dy)
+                distance = math.hypot(px - dx, py - dy)
+                slack = shape_slack[i,j] if shape_slack is not None else 0.
+                reach_limit = max_displacements[i] + slack if max_displacements is not None else math.inf
                 reachable = (last_measured is None or
-                             math.hypot(dx-last_measured[i][0],dy-last_measured[i][1]) <= max_displacements[i]+(shape_slack[i,j] if shape_slack is not None else 0.))
-                if d <= self.gate and reachable:
-                    cost[i, j] = d
+                             math.hypot(dx-last_measured[i][0],dy-last_measured[i][1]) <= reach_limit)
+                if distance <= self.gate and reachable:
+                    size_error = size_differences[i,j] if size_differences is not None else 0.
+                    allowed[i,j] = True
+                    cost[i,j] = distance + self.size_weight * size_error
         if _HAS_SCIPY:
             rows, cols = linear_sum_assignment(cost)
-            matched = [(int(ri), int(ci)) for ri, ci in zip(rows, cols)
-                       if cost[ri, ci] <= self.gate]
+            matched = [(int(i), int(j)) for i, j in zip(rows, cols) if allowed[i,j]]
         else:
-            # 贪心：按成本升序逐一锁定（成本 < INF 才允许）
-            pairs = [(int(i), int(j), float(cost[i, j]))
-                     for i in range(n) for j in range(m) if cost[i, j] <= self.gate]
-            pairs.sort(key=lambda t: t[2])
-            used_t, used_d = set(), set()
-            matched = []
-            for i, j, c in pairs:
-                if i in used_t or j in used_d:
-                    continue
-                used_t.add(i)
-                used_d.add(j)
-                matched.append((i, j))
-        matched_det = {d for _, d in matched}
-        unmatched = [j for j in range(m) if j not in matched_det]
-        return matched, unmatched
+            pairs = [(int(i), int(j), float(cost[i,j])) for i, j in zip(*np.nonzero(allowed))]
+            pairs.sort(key=lambda pair: pair[2])
+            used_t, used_d, matched = set(), set(), []
+            for i, j, _ in pairs:
+                if i not in used_t and j not in used_d:
+                    used_t.add(i); used_d.add(j); matched.append((i, j))
+        matched_det = {j for _, j in matched}
+        return matched, [j for j in range(m) if j not in matched_det]
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +218,12 @@ class GlobalKFTracker:
 
     STATIC_TYPES = ('static_large', 'block')
 
-    def __init__(self, dt: float = 0.1, gate: float = 1.0, lost_ttl: int = 10,
-                 q: float = 0.3, r: float = 0.15, max_speed: float = 1.5,
+    def __init__(self, dt: float = 0.1, gate: float = 0.5, lost_ttl: int = 3,
+                 q: float = 0.3, r: float = 0.15, max_speed: float = 1.0,
                  dyn_speed_thr: float = 0.3, dyn_hold_frames: int = 5,
                  static_speed_thr: float = 0.15, static_hold_frames: int = 10,
-                 static_small_thr: float = 0.6, position_slack: float = 0.15):
+                 static_small_thr: float = 0.6, position_slack: float = 0.15,
+                 size_weight: float = 0.5, shape_slack_max: float = 0.35):
         self.dt = float(dt)
         self.gate = float(gate)
         self.lost_ttl = int(lost_ttl)
@@ -233,11 +236,14 @@ class GlobalKFTracker:
         self.static_hold_frames = int(static_hold_frames)
         self.static_small_thr = float(static_small_thr)
         self.position_slack = float(position_slack)
-        if not math.isfinite(self.position_slack) or self.position_slack<0:
-            raise ValueError('invalid association position slack')
+        self.shape_slack_max = float(shape_slack_max)
+        if not all(math.isfinite(v) and v >= 0 for v in (self.position_slack, self.shape_slack_max)):
+            raise ValueError('invalid association position/shape slack')
+        if not math.isfinite(self.max_speed) or self.max_speed <= 0 or self.lost_ttl < 1:
+            raise ValueError('invalid scene speed bound or miss TTL')
         self.tracks: dict[int, KFTrack] = {}
         self._next_id = 1
-        self._matcher = HungarianMatcher(gate=self.gate)
+        self._matcher = HungarianMatcher(gate=self.gate, size_weight=size_weight)
 
     # ------------------------------------------------------------------
     def reset(self):
@@ -270,21 +276,21 @@ class GlobalKFTracker:
 
         pred = [self.tracks[i].position() for i in ids]
         det_xy = [(d[0], d[1]) for d in detections]
-        # A fixed 1 m gate at 10--20 Hz can join two alternating static
-        # clusters into a fictitious moving track. Check reachability from the
-        # last actual measurement, with elapsed source time and noise slack.
-        measured=[self.tracks[i].last_measurement for i in ids]
-        bounds=[self.max_speed*self.tracks[i].measurement_age+self.position_slack for i in ids]
-        # Partial visibility changes a box centre as its dimensions change.
-        # Account for that bounded effect without widening identical small
-        # clusters' gates (the alternating-cluster false-motion regression).
-        shape_slack=np.zeros((len(ids),len(detections)))
-        for i,tid in enumerate(ids):
-            old=sorted((self.tracks[tid].length,self.tracks[tid].width))
-            for j,d in enumerate(detections):
-                new=sorted((float(d[3]),float(d[4])))
-                shape_slack[i,j]=min(.35,.5*math.hypot(new[0]-old[0],new[1]-old[1]))
-        matched, unmatched_det = self._matcher.match(pred, det_xy, measured, bounds,shape_slack)
+        # Source-time reachability uses all elapsed time across missed frames.
+        measured = [self.tracks[i].last_measurement for i in ids]
+        bounds = [self.max_speed*self.tracks[i].measurement_age+self.position_slack for i in ids]
+        shape_slack = np.zeros((len(ids),len(detections)))
+        size_differences = np.zeros_like(shape_slack)
+        for i, tid in enumerate(ids):
+            track = self.tracks[tid]
+            old = sorted((track.measured_length, track.measured_width))
+            for j, detection in enumerate(detections):
+                new = sorted((float(detection[3]), float(detection[4])))
+                difference = math.hypot(new[0]-old[0], new[1]-old[1])
+                size_differences[i,j] = difference
+                shape_slack[i,j] = min(self.shape_slack_max, 0.5*difference)
+        matched, unmatched_det = self._matcher.match(pred, det_xy, measured, bounds,
+                                                     shape_slack, size_differences)
 
         # 匹配 → 更新
         for ti, di in matched:
@@ -342,8 +348,8 @@ class GlobalKFTracker:
         """输出 [(id, x, y, speed, heading, otype, L, W)]，按 id 升序。
 
         类型由运动性判定决策；检测名称仅表示尺寸提示：
-          - 未确认或漏检动态目标 → unknown，最新实测位置/尺寸、速度 0
-          - moving=True 且本帧匹配 → 保留 pedestrian/bicycle/vehicle 尺寸提示，输出 KF 速度
+          - 未确认目标 → unknown，最新实测位置/尺寸、速度 0
+          - moving=True → 保留动态类别，匹配帧更新、漏检帧预测，输出 KF 速度
           - moving=False → 静态：长边 ≤ static_small_thr → 'block'，否则 'static_large'
             （速度 0，框的真实方向仍通过 shape_heading 保留）
         """
@@ -358,12 +364,14 @@ class GlobalKFTracker:
                 sp,hd=t.speed_heading();otype='unknown'
             else:
                 sp, hd = 0.0, 0.0
+                if t.miss:
+                    # Static output has zero velocity; retain the last filtered
+                    # observed centre instead of drifting on KF velocity noise.
+                    x, y = t.last_filtered_position
                 otype = 'block' if max(t.length, t.width) <= self.static_small_thr \
                     else 'static_large'
-            # Keep a measured, confirmed static obstacle through the existing
-            # short miss TTL. Missing it for one scan does not prove motion.
-            # A missed mover returns to the requested stationary unknown policy.
-            if t.miss and (t.moving or t._st_cnt<self.static_hold_frames):otype='unknown'
+            # Misses preserve the last confirmed motion class. KF predict()
+            # has already advanced movers to this cloud's acquisition time.
             length,width=t.length,t.width
             if otype=='unknown':
                 x,y=t.last_measurement

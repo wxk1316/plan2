@@ -104,12 +104,12 @@ class RealVehicleBridgeNode(Node):
         self.declare_parameter('trap_exit_sector_range', 2.5)
         self.declare_parameter('trap_exit_sector_max_obs', 3)
         self.declare_parameter('trap_max_duration', 16.0)   # trap 兜底最大持续 s（替代 120 步=12s）
-        self.declare_parameter('obstacle_max_speed', 1.5)
+        self.declare_parameter('obstacle_max_speed', 1.0)
         self.declare_parameter('cluster_gate', 0.6)
         self.declare_parameter('cluster_min_points', 2)
         self.declare_parameter('cluster_max_radius', 30.0)
-        self.declare_parameter('track_gate', 1.0)
-        self.declare_parameter('track_lost_ttl', 5)
+        self.declare_parameter('track_gate', 0.5)
+        self.declare_parameter('track_lost_ttl', 3)
         # 算法车辆参数（实车几何/运动学）
         self.declare_parameter('vehicle_length', 1.2)
         self.declare_parameter('vehicle_width', 0.8)
