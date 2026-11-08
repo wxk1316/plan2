@@ -124,6 +124,18 @@ class KFTrack:
     def position(self) -> tuple:
         return float(self.x[0]), float(self.x[1])
 
+    def association_position(self) -> tuple:
+        """Matching prediction: fixed unknown/static centres, CV for movers.
+
+        Keep the internal KF prior/velocity alive for learning motion from real
+        measurements; its unconfirmed motion must not move the matching gate.
+        """
+        if self.moving:
+            return self.position()
+        if self._st_cnt >= self.static_hold_frames:
+            return self.last_filtered_position
+        return self.last_measurement
+
     def velocity(self) -> tuple:
         return float(self.x[2]), float(self.x[3])
 
@@ -274,7 +286,7 @@ class GlobalKFTracker:
         for t in self.tracks.values():
             t.predict()
 
-        pred = [self.tracks[i].position() for i in ids]
+        pred = [self.tracks[i].association_position() for i in ids]
         det_xy = [(d[0], d[1]) for d in detections]
         # Source-time reachability uses all elapsed time across missed frames.
         measured = [self.tracks[i].last_measurement for i in ids]
