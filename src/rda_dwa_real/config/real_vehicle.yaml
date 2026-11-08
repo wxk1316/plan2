@@ -233,6 +233,9 @@ traj_tracker_node:
     stop_window_s: 1.0
 lidar_track_node:
   ros__parameters:
+    async_perception: true
+    perception_max_source_age_s: 0.4
+    track_reset_gap_s: 2.0
     localization_source: latest_available
     localization_parent_frame: map
     localization_child_frame: body

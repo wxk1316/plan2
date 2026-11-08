@@ -56,6 +56,7 @@ from .frame_utils import body_to_world_2d, quat_to_yaw, body_pose_to_base_link
 from .kf_tracker import GlobalKFTracker
 from .localization_input import LocalizationInput
 from .perception_core import LidarPerceptionCore, PerceptionParams, point_cloud_xyz
+from .async_perception import AsyncPerception,cloud_packet
 
 
 class LidarTrackNode(Node):
@@ -71,6 +72,9 @@ class LidarTrackNode(Node):
         self.declare_parameter('obstacles_topic', '/rda/obstacles')
         # 雷达安装高度（base_link → rslidar z 偏移，用于 z 系转换）
         self.declare_parameter('lidar_height', 0.45)
+        self.declare_parameter('async_perception', False)
+        self.declare_parameter('perception_max_source_age_s', .4)
+        self.declare_parameter('track_reset_gap_s', 2.0)
         # === 对齐原项目 cloud_seg 流程（base_link 系）===
         # ① 第一级直通滤波范围（base_link 系）
         self.declare_parameter('pass_x_min', -10.0)
@@ -186,6 +190,11 @@ class LidarTrackNode(Node):
             sensor_x=float(self.get_parameter('sensor_x').value),sensor_y=float(self.get_parameter('sensor_y').value),
             sensor_yaw=float(self.get_parameter('sensor_yaw').value)))
 
+        self._max_source_age=float(self.get_parameter('perception_max_source_age_s').value)
+        self._track_reset_gap=float(self.get_parameter('track_reset_gap_s').value)
+        if self._max_source_age<=0 or self._track_reset_gap<=0:raise ValueError('perception time limits must be positive')
+        self._async_enabled=bool(self.get_parameter('async_perception').value)
+        self._async_perception=None;self._last_received_source=None;self._worker_failure_reported=False
         # ---------------- 状态 ----------------
         self._loc = None            # (x, y, yaw) 最近定位
         self._loc_t = 0.0           # 最近定位到达时刻（节点时钟）
@@ -211,10 +220,16 @@ class LidarTrackNode(Node):
         self._pub_markers = self.create_publisher(
             MarkerArray, '/rda/obstacles_markers', 10)
 
+        if self._async_enabled:
+            self._async_perception=AsyncPerception(self._perception.p,self._tracker,self._track_reset_gap,self._max_source_age)
+            self._worker_timer=self.create_timer(.02,self._poll_perception)
+
         self.get_logger().info(
             f'lidar_track_node 启动: points={self._points_topic} '
             f'odom={self._odom_topic} → {self._obstacles_topic} '
-            f'cluster_gate={self._clusterer.gate} track_gate={self._tracker.gate}')
+            f'cluster_gate={self._clusterer.gate} track_gate={self._tracker.gate} '
+            f'async_perception={self._async_enabled} max_source_age={self._max_source_age:.2f}s '
+            f'track_reset_gap={self._track_reset_gap:.2f}s')
 
     # ==================================================================
     # 回调
@@ -238,6 +253,8 @@ class LidarTrackNode(Node):
         self._loc_t = msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9
 
     def _cb_cloud(self,msg:PointCloud2):
+        if self._async_enabled:
+            self._submit_cloud(msg);return
         begin=time.monotonic();self._perception_seq+=1
         sample = self._localization_input.sample(self._loc_timeout, now=begin)
         if sample is not None:
@@ -260,14 +277,66 @@ class LidarTrackNode(Node):
             self._perception_metrics.update(producer_monotonic_ns=time.monotonic_ns(),producer_ros_ns=self.get_clock().now().nanoseconds,duration_s=time.monotonic()-begin,source_dt_s=getattr(self,'_cloud_dt',None))
             self._pub_perception_diag.publish(String(data=json.dumps(safe_data(self._perception_metrics),allow_nan=False)))
 
+    def _submit_cloud(self,msg):
+        """Fast callback: snapshot pose and replace the waiting observation."""
+        now=time.monotonic();self._perception_seq+=1
+        ros_now=self.get_clock().now().nanoseconds*1e-9
+        stamp=msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9;age=ros_now-stamp
+        metrics=dict(schema_version=1,sequence=self._perception_seq,source_stamp=stamp,source_frame=msg.header.frame_id,
+                     source_age_at_receive_s=age,source_age_s=age,raw_points=msg.width*msg.height,raw_bytes=len(msg.data),async_perception=True)
+        sample=self._localization_input.sample(self._loc_timeout,now=now)
+        metrics['localization_input']=self._localization_input.diagnostic()
+        reason=None
+        if self._last_received_source is not None and stamp<=self._last_received_source:reason='cloud_source_stale_or_repeated'
+        elif age>self._max_source_age:reason='cloud_source_stale_or_repeated'
+        elif age<-.05:reason='cloud_source_future'
+        elif sample is None:reason='localization_unavailable'
+        elif self._pub_obs is None:reason='obstacle_message_unavailable'
+        if reason is not None:
+            metrics['reason']=reason;self._emit_perception_diag(metrics);return
+        pose,effective,receive_age=sample
+        self._loc=body_pose_to_base_link(*pose,self._body_to_base_x);self._loc_t=effective
+        metrics.update(location_pose_used=self._loc,location_source_stamp=self._localization_input.stamp,
+                       location_effective_stamp=effective,location_age_s=receive_age,
+                       location_age_clock='monotonic_receive' if self._localization_input.uses_latest_topic else 'ros_source')
+        self._last_received_source=stamp
+        self._async_perception.submit((self._perception_seq,now,cloud_packet(msg),self._loc,metrics))
+
+    def _poll_perception(self):
+        result=self._async_perception.poll()
+        if result is None:
+            if not self._async_perception.process.is_alive() and not self._worker_failure_reported:
+                self._worker_failure_reported=True;self._emit_perception_diag(dict(reason='perception_worker_failed',async_perception=True))
+            return
+        seq,received,sec,nanosec,tracks,metrics=result;now=time.monotonic()
+        age=metrics['source_age_at_receive_s']+max(0.,now-received)
+        metrics.update(worker_reason=metrics['reason'],source_age_s=age,receive_to_result_s=max(0.,now-received),
+                       submitted=self._async_perception.submitted,submit_skipped=self._async_perception.skipped)
+        if tracks is not None and age<=self._max_source_age:
+            header=self.get_clock().now().to_msg();header.sec=sec;header.nanosec=nanosec
+            self._cloud_source_stamp=header;self._publish_obstacles(tracks)
+            metrics['obstacle_published']=True
+        else:
+            metrics['obstacle_published']=False
+            if tracks is not None:metrics['reason']='perception_result_stale'
+        self._emit_perception_diag(metrics)
+
+    def _emit_perception_diag(self,metrics):
+        metrics.update(producer_monotonic_ns=time.monotonic_ns(),producer_ros_ns=self.get_clock().now().nanoseconds)
+        self._perception_metrics=metrics
+        self._pub_perception_diag.publish(String(data=json.dumps(safe_data(metrics),allow_nan=False)))
+
+    def destroy_node(self):
+        if self._async_perception is not None:self._async_perception.close()
+        return super().destroy_node()
+
     def _process_cloud(self, msg: PointCloud2):
         stamp=msg.header.stamp.sec+msg.header.stamp.nanosec*1e-9
         now=self.get_clock().now().nanoseconds*1e-9
-        if stamp<=getattr(self,'_last_cloud_source',-1e9) or now-stamp>.4:return 'cloud_source_stale_or_repeated'
+        if stamp<=getattr(self,'_last_cloud_source',-1e9) or now-stamp>self._max_source_age:return 'cloud_source_stale_or_repeated'
         if msg.point_step<=0 or not msg.data or not {'x','y'}.issubset({f.name for f in msg.fields}):return 'malformed_cloud'
         previous=getattr(self,'_last_cloud_source',None)
         self._cloud_dt=(stamp-previous) if previous is not None else self._tracker.dt
-        if self._cloud_dt>.5:self._tracker.reset()
         self._last_cloud_source=stamp;self._cloud_source_stamp=msg.header.stamp
         if self._loc is None:
             return 'no_localization'  # 尚无定位，不发布（bridge 定位超时急停）
@@ -284,8 +353,14 @@ class LidarTrackNode(Node):
         dets_body,metrics=self._perception.process(xyz,stamp,pose=self._loc)
         self._perception_metrics.update(metrics,filter_cluster_duration_s=time.monotonic()-phase)
         if not metrics['valid']:return metrics['reason']
+        tracking_previous=getattr(self,'_last_tracking_source',None)
+        tracking_dt=stamp-tracking_previous if tracking_previous is not None else self._tracker.dt
+        reset=tracking_previous is not None and tracking_dt>self._track_reset_gap
+        if reset:self._tracker.reset()
+        self._last_tracking_source=stamp
+        self._perception_metrics.update(track_reset=reset,tracking_dt_s=tracking_dt)
         if not dets_body:
-            self._publish_obstacles(self._tracker.step([],dt=max(.005,min(.5,self._cloud_dt))))
+            self._publish_obstacles(self._tracker.step([],dt=max(.005,tracking_dt)))
             return 'empty_cloud_predicted_tracks'
         # ⑦ 转到全局系（map），供全局匹配
         rx, ry, rth = self._loc
@@ -296,7 +371,7 @@ class LidarTrackNode(Node):
 
         self._perception_metrics['detections_world']=dets_world
         # ⑧ 全局系 KF + 匈牙利 → 稳定 id
-        phase=time.monotonic();tracks = self._tracker.step(dets_world, dt=max(.005,min(.5,self._cloud_dt)))
+        phase=time.monotonic();tracks = self._tracker.step(dets_world, dt=max(.005,tracking_dt))
 
         # ⑨ 发布（frame_id='map'）
         self._publish_obstacles(tracks)
