@@ -77,7 +77,7 @@ def obstacle_from_object(o):
                            int(getattr(o,'id',0)),uncertain,1.5 if uncertain else 0.)
 
 
-def minimum_gaps(poses, times, obstacles, geometry, age=0., interval_bound=0.):
+def minimum_gaps(poses, times, obstacles, geometry, age=0., interval_bound=0.,valid_until=None):
     """Conservative OBB separation at samples, minus uncertainty/sweep bounds.
 
     poses: (..., T, 3), times: (T,). Returns shape (...,), minimum gap over T.
@@ -112,6 +112,10 @@ def minimum_gaps(poses, times, obstacles, geometry, age=0., interval_bound=0.):
         d-=o.uncertainty_speed*tt[None,:]
         obstacle_speed=o.uncertainty_speed if o.uncertain else o.speed
         d-=interval_bound + obstacle_speed*(times[1]-times[0])/2 if len(times)>1 else interval_bound
+        if valid_until is not None:
+            limit=np.asarray(valid_until,dtype=float).reshape(-1,1)
+            if not np.isfinite(limit).all():return np.full(shape,-np.inf)
+            d=np.where(times[None,:]<=np.maximum(0.,limit)+1e-12,d,np.inf)
         gaps=np.minimum(gaps,d)
     return np.min(gaps,axis=-1).reshape(shape)
 
@@ -164,7 +168,7 @@ def spin_is_safe(x,y,yaw,target,obstacles,geometry,age=0.,wait=3.,speed=.6,margi
     return bool(minimum_gaps(poses,times,obstacles,geometry,age,bound)>=margin)
 
 def rollout_stop(x,y,yaw,speed,steer,vs,ds,geometry,horizon=3.,dt=.1,reaction=.25,dec=.8,
-                 jerk=None,steer_accel=None,initial_acc=0.,initial_steer_rate=0.):
+                 jerk=None,steer_accel=None,initial_acc=0.,initial_steer_rate=0.,return_speeds=False):
     """Candidate's first action, delayed braking, then stationary occupancy.
 
     This guards safe stopping locations for moving obstacles: a nominal cruise
@@ -176,6 +180,7 @@ def rollout_stop(x,y,yaw,speed,steer,vs,ds,geometry,horizon=3.,dt=.1,reaction=.2
     vec=lambda value:np.broadcast_to(np.asarray(value,dtype=float),(n,)).copy()
     rear=np.empty((n,len(tt),3));xx=vec(x);yy=vec(y);th=vec(yaw);vv=np.maximum(0.,vec(speed));delta=vec(steer)
     acceleration=vec(initial_acc);rate=vec(initial_steer_rate);held_target=vec(steer)
+    speed_history=np.empty((n,len(tt)));speed_history[:,0]=vv
     rear[:,0]=np.column_stack((xx,yy,th))
     for j,t in enumerate(tt[1:],1):
         target=vs if t<=reaction else np.zeros(n)
@@ -192,4 +197,51 @@ def rollout_stop(x,y,yaw,speed,steer,vs,ds,geometry,horizon=3.,dt=.1,reaction=.2
         omega=vv*np.tan(delta)/geometry.wheelbase;mid=th+omega*h/2
         xx+=vv*np.cos(mid)*h;yy+=vv*np.sin(mid)*h;th+=omega*h
         rear[:,j]=np.column_stack((xx,yy,th))
-    return rear,tt
+        speed_history[:,j]=vv
+    return (rear,tt,speed_history) if return_speeds else (rear,tt)
+
+
+def stopping_time_limit(speeds,times,reaction=.4):
+    """Check unknown reachability until near-stop plus settling occupancy.
+
+    Long geometry/known-CV rollouts remain separate. A receding controller
+    commits only a short action, with this fully checked braking backup.
+    It does not promise a stopped car remains safe from an actor forever.
+    """
+    last=np.max(np.where(np.asarray(speeds)>.01,np.asarray(times)[None,:],0.),axis=-1)
+    return np.minimum(times[-1],np.maximum(reaction+.2,last+.2))
+
+
+def unknown_command_gap(x,y,yaw,speed,steer,v,delta,obstacles,geometry,age=0.,initial_acc=0.,initial_steer_rate=0.):
+    unknown=[o for o in obstacles if o.uncertain]
+    if not unknown:return math.inf
+    if not all(math.isfinite(q) for q in (x,y,yaw,speed,steer,v,delta,age,initial_acc,initial_steer_rate)):return -math.inf
+    # This guard runs at controller frequency: use the same scalar servo
+    # equations without allocating one-element arrays at every integration tick.
+    horizon=max(3.,max(speed,0.)/.8+1.2);count=int(math.ceil(horizon/.05));h=horizon/count
+    times=np.linspace(0.,horizon,count+1);poses=[(x,y,yaw)];history=[max(0.,speed)]
+    vv=max(0.,float(speed));d=float(steer);a=float(initial_acc);rate=float(initial_steer_rate);held=d
+    max_rate=math.radians(30);max_acc=math.radians(100)
+    def clip(value,low,high):return max(low,min(high,value))
+    for t in times[1:]:
+        target=v if t<=.4 else 0.;error=target-vv
+        allowed=math.sqrt(4.*abs(error)+(2.*h)**2)-2.*h
+        wanted=math.copysign(min(abs(error)/.3,allowed),error) if error else 0.
+        wanted=clip(wanted,-.8,.7)
+        if abs(error)<.0001 and abs(a)<2.*h:wanted=0.
+        a+=clip(wanted-a,-2.*h,2.*h);vv=max(0.,vv+a*h)
+        desired=delta if t<=.4 else held;error=desired-d
+        allowed=math.sqrt(2.*max_acc*abs(error)+(max_acc*h)**2)-max_acc*h
+        wanted=math.copysign(min(max_rate,allowed),error) if error else 0.
+        if abs(error)<=math.radians(.15) and abs(rate)<=max_acc*h:wanted=0.
+        rate+=clip(wanted-rate,-max_acc*h,max_acc*h);d+=rate*h
+        if t<=.4:held=d
+        omega=vv*math.tan(d)/geometry.wheelbase;mid=yaw+omega*h/2
+        x+=vv*math.cos(mid)*h;y+=vv*math.sin(mid)*h;yaw+=omega*h
+        poses.append((x,y,yaw));history.append(vv)
+    rear=np.asarray([poses]);speeds=np.asarray([history])
+    maximum=float(np.max(speeds))
+    turn_bound=max(abs(steer),abs(delta),math.radians(30))+math.radians(30)**2/(2*math.radians(100))
+    sweep=(maximum+maximum*math.tan(turn_bound)/geometry.wheelbase*geometry.radius)*.025+.002
+    return float(minimum_gaps(to_centres(rear,geometry),times,unknown,geometry,age,sweep,
+                              valid_until=stopping_time_limit(speeds,times))[0])

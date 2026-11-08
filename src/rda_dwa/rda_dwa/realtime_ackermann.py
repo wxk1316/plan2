@@ -1,13 +1,15 @@
 """Bounded Ackermann RDA-DWA execution for the real vehicle.
 
-Samples executable steering targets, checks ramped OBB trajectories at all
-prediction times, and uses a persistent static visibility guide. No ROS.
+Samples executable steering targets with a persistent static visibility guide.
+Known occupancy uses the full forecast; unknown occupancy checks the committed
+action and complete braking backup. Execution rechecks fresh observations.
+No ROS.
 """
 import math,time,heapq
 from dataclasses import replace
 import numpy as np
 from .enhanced_dwa import EnhancedDWA
-from .motion_safety import VehicleGeometry,rollout_rear,to_centres,minimum_gaps,obstacle_from_object,rollout_stop
+from .motion_safety import VehicleGeometry,rollout_rear,to_centres,minimum_gaps,obstacle_from_object,rollout_stop,stopping_time_limit
 
 class RealtimeAckermannPlanner(EnhancedDWA):
     def __init__(self,*args,**kwargs):
@@ -15,7 +17,7 @@ class RealtimeAckermannPlanner(EnhancedDWA):
         self.geometry=VehicleGeometry(self.cc.ack.length,self.cc.ack.width,self.cc.ack.wheelbase)
         self.reference=[];self.telemetry={};self._guide=[];self._guide_goal=None
         self.current_steer=0.;self.obstacle_age=0.
-        self.current_acc=0.;self.current_steer_rate=0.;self._encounter=None
+        self.current_acc=0.;self.current_steer_rate=0.;self._encounter=None;self._provisional=None
     def _guide_target(self,start,goal,obstacles,deadline):
         # Guide boxes are a separate geometric heuristic; the final OBB rollout
         # ALWAYS validates physical length, width, orientation and safety margin.
@@ -67,8 +69,9 @@ class RealtimeAckermannPlanner(EnhancedDWA):
             while i:route.append(nodes[i]);i=prev[i]
             self._guide=list(reversed(route));return outward(self._guide[0])
         return outward(goal)
-    def _closing_actor(self,centre,yaw,speed,obs):
+    def _closing_actor(self,centre,yaw,speed,obs,stamp=None):
         """Latch the side of a closing encounter until the actor passes."""
+        stamp=time.monotonic() if stamp is None else stamp
         forward=np.array([math.cos(yaw),math.sin(yaw)])
         if self._encounter is not None:
             e=self._encounter
@@ -76,6 +79,10 @@ class RealtimeAckermannPlanner(EnhancedDWA):
             if actor is not None:
                 rel=np.array([actor.x-centre[0],actor.y-centre[1]])
                 if rel@e['axis']>-(self.geometry.length+actor.length):return actor
+            uncertain=next((o for o in obs if o.ident==e['id'] and o.uncertain),None)
+            if uncertain is not None:
+                self._provisional=dict(id=e['id'],axis=e['axis'],origin=e['origin'],side=e['side'],
+                                       seen_at=stamp,obstacle_centre=(uncertain.x,uncertain.y))
             self._encounter=None
         choices=[]
         for o in obs:
@@ -89,8 +96,27 @@ class RealtimeAckermannPlanner(EnhancedDWA):
                 if ttc<7.:choices.append((ttc,o))
         if not choices:return None
         actor=min(choices,key=lambda q:q[0])[1]
-        self._encounter=dict(id=actor.ident,axis=forward,origin=np.asarray(centre),side=0)
+        self._encounter=dict(id=actor.ident,axis=forward,origin=np.asarray(centre),side=self._provisional['side'] if self._provisional and self._provisional['id']==actor.ident else 0)
         return actor
+
+    def _unknown_in_corridor(self,centre,yaw,obs,stamp=None):
+        stamp=time.monotonic() if stamp is None else stamp
+        forward=np.array([math.cos(yaw),math.sin(yaw)])
+        relevant=[]
+        for o in obs:
+            if not o.uncertain:continue
+            rel=np.array([o.x-centre[0],o.y-centre[1]])
+            along=float(rel@forward);lateral=abs(rel[0]*forward[1]-rel[1]*forward[0])
+            if .3<along<6. and lateral<self.geometry.width/2+max(o.length,o.width)/2+.3:
+                relevant.append((along,o))
+        if not relevant:self._provisional=None;return None
+        actor=min(relevant,key=lambda q:q[0])[1]
+        prior=self._provisional
+        same_patch=prior is not None and 0.<=stamp-prior['seen_at']<.8 and math.dist(prior['obstacle_centre'],(actor.x,actor.y))<.8
+        if prior is None or (prior['id']!=actor.ident and not same_patch):
+            self._provisional=dict(id=actor.ident,axis=forward,origin=np.asarray(centre),side=0)
+        self._provisional.update(id=actor.ident,seen_at=stamp,obstacle_centre=(actor.x,actor.y))
+        return self._provisional
 
     def _future_refuge(self,poses,times,obs,margin):
         """Terminal parked refuge against each known CV actor's future ray.
@@ -127,7 +153,8 @@ class RealtimeAckermannPlanner(EnhancedDWA):
         forecast=getattr(self.params,'velocity_horizon_targets',False)
         vmax=min(self.params.max_linear_velocity,getattr(self.params,'cruise_velocity',1.),goal_cap)
         if not forecast:vmax=min(vmax,max(0.,robot.v)+acc*dt)
-        actor=self._closing_actor(centre,robot.theta,robot.v,obs) if getattr(self.params,'staged_avoidance',True) else None
+        actor=self._closing_actor(centre,robot.theta,robot.v,obs,getattr(robot,'planning_stamp',None)) if getattr(self.params,'staged_avoidance',True) else None
+        provisional=self._unknown_in_corridor(centre,robot.theta,obs,getattr(robot,'planning_stamp',None)) if actor is None else None
         if actor is not None:
             e=self._encounter;normal=np.array([-e['axis'][1],e['axis'][0]])
             # A fixed world direction prevents left/right chattering. The final
@@ -135,6 +162,9 @@ class RealtimeAckermannPlanner(EnhancedDWA):
             side=e['side'] or 1
             local=tuple(e['origin']+1.1*e['axis']+side*1.5*normal)
             vmax=min(self.params.max_linear_velocity,getattr(self.params,'cruise_velocity',1.))
+        if provisional is not None:
+            normal=np.array([-provisional['axis'][1],provisional['axis'][0]])
+            local=tuple(provisional['origin']+1.1*provisional['axis']+(provisional['side'] or 1)*1.5*normal)
         horizon=max(self.params.sim_time,5. if actor is not None else 0.)
         times=np.linspace(0.,horizon,int(math.ceil(horizon/.05))+1)
         # Forecast targets are desired servo inputs, not instantaneous actual
@@ -181,13 +211,26 @@ class RealtimeAckermannPlanner(EnhancedDWA):
         # start near a wall before the car has accelerated at all.
         sweep=np.maximum(rates_of_motion,np.c_[rates_of_motion[:,1:],rates_of_motion[:,-1]])*.025+.002
         margin=getattr(self.params,'safety_margin',.12)
-        gaps=minimum_gaps(centres,times,obs,self.geometry,self.obstacle_age,sweep)
+        known=[o for o in obs if not o.uncertain];unknown=[o for o in obs if o.uncertain]
+        gaps=minimum_gaps(centres,times,known,self.geometry,self.obstacle_age,sweep)
+        if unknown:
+            prefix=minimum_gaps(centres,times,unknown,self.geometry,self.obstacle_age,sweep,valid_until=.4)
+            gaps=np.minimum(gaps,prefix)
         dynamic=any(o.speed>.1 or o.uncertain for o in obs)
-        if dynamic and forecast:
-            stop,st=rollout_stop(robot.x,robot.y,robot.theta,robot.v,self.current_steer,
-                vtargets[:,0],dtargets[:,0],self.geometry,horizon,.05,jerk=jerk,
-                steer_accel=steer_acc,initial_acc=self.current_acc,initial_steer_rate=self.current_steer_rate)
-            stop_gaps=minimum_gaps(to_centres(stop,self.geometry),st,obs,self.geometry,self.obstacle_age,sweep)
+        stop_limits=None;unknown_stop=None
+        if dynamic and (forecast or unknown):
+            stop,st,stop_speeds=rollout_stop(robot.x,robot.y,robot.theta,robot.v,self.current_steer,
+                vtargets[:,0],dtargets[:,0],self.geometry,horizon,.05,reaction=.4,jerk=jerk,
+                steer_accel=steer_acc,initial_acc=self.current_acc,initial_steer_rate=self.current_steer_rate,return_speeds=True)
+            stop_rate=stop_speeds*(1.+math.tan(self.cc.ack.delta_max+steer_rate**2/(2*steer_acc))/self.geometry.wheelbase*self.geometry.radius)
+            stop_sweep=np.maximum(stop_rate,np.c_[stop_rate[:,1:],stop_rate[:,-1]])*.025+.002
+            stop_gaps=minimum_gaps(to_centres(stop,self.geometry),st,known,self.geometry,self.obstacle_age,stop_sweep)
+            if unknown:
+                stop_limits=stopping_time_limit(stop_speeds,st)
+                unknown_stop=minimum_gaps(to_centres(stop,self.geometry),st,unknown,self.geometry,self.obstacle_age,stop_sweep,valid_until=stop_limits)
+                # Unknown protection is required for every selected candidate,
+                # including a staged refuge with a known actor.
+                gaps=np.minimum(gaps,unknown_stop)
             # For a head-on escape, stopping in the actor's path is insufficient.
             # Only a complete staged path ending in a checked lateral refuge
             # may use continuation instead of the ordinary stop-now backup.
@@ -205,7 +248,7 @@ class RealtimeAckermannPlanner(EnhancedDWA):
         feasibility=dict(candidates=len(vtargets),feasible=int(sum(feasible)),motion_feasible=bool(np.any(feasible&movement)),
              obstacle_count=len(obs),unknown_count=sum(o.uncertain for o in obs),moving_count=sum(o.speed>.1 for o in obs),
              best_gap=finite_gap(np.max(gaps)),encounter_id=actor.ident if actor else None,
-             avoidance_side=self._encounter['side'] if actor else 0,staged_feasible=int(sum(feasible&staged)))
+             avoidance_side=self._encounter['side'] if actor else 0,staged_feasible=int(sum(feasible&staged)),unknown_policy='action_and_brake',unknown_reaction_s=.4)
         if time.perf_counter()>deadline:
             self.telemetry=dict(feasibility,reason='planning_budget',duration_s=time.perf_counter()-begin);return False,0.,0.
         end=centres[:,-1,:];d0=math.dist(centre,local);dist=np.hypot(end[:,0]-local[0],end[:,1]-local[1])
@@ -214,6 +257,14 @@ class RealtimeAckermannPlanner(EnhancedDWA):
         score+=.15*np.minimum(gaps,.4)
         score-=getattr(self.params,'steer_weight',.4)*np.mean((dtargets/self.cc.ack.delta_max)**2,axis=1)
         score-=getattr(self.params,'steer_change_weight',.12)*((dtargets[:,0]-self.current_steer)/self.cc.ack.delta_max)**2
+        if provisional is not None:
+            axis=provisional['axis'];normal=np.array([-axis[1],axis[0]])
+            for side in (-1,1):
+                target=provisional['origin']+1.1*axis+side*1.5*normal
+                mask=(dtargets[:,0]>=0.) if side==1 else (dtargets[:,0]<0.)
+                if provisional['side'] and side!=provisional['side']:score[mask]-=100.
+                else:score[mask]+=3*(dist[mask]-np.linalg.norm(end[mask,:2]-target,axis=1))
+            score+=np.where(dtargets[:,0]>=0.,.01,0.)
         if actor is not None and not self._encounter['side']:
             # Equal-cost ties have a stable preference; blocked sides remain
             # available until a physically feasible choice is established.
@@ -235,6 +286,9 @@ class RealtimeAckermannPlanner(EnhancedDWA):
             return False,0.,0.
         k=int(np.flatnonzero(score>=np.max(score)-1e-10)[0])
         cruise=float(vtargets[k,0]);delta=float(dtargets[k,0]);v=cruise
+        if provisional is not None and cruise>.005 and abs(delta)>.05:
+            provisional['side']=1 if delta>0. else -1
+            feasibility['provisional_avoidance_id']=provisional['id'];feasibility['avoidance_side']=provisional['side']
         if staged[k] and actor is not None:
             self._encounter['side']=int(sides[k]);feasibility['avoidance_side']=int(sides[k])
             if not continuation[k]:
@@ -248,5 +302,7 @@ class RealtimeAckermannPlanner(EnhancedDWA):
                ('dynamic_wait' if actor is not None else ('orientation_stall' if feasibility['motion_feasible'] else ('dynamic_yield' if static_motion and dynamic else 'blocked'))))
         self.telemetry=dict(feasibility,reason=reason,duration_s=time.perf_counter()-begin,
              min_gap=finite_gap(gaps[k]),guide_target=local,selected_delta=delta,staged_selected=bool(staged[k]),
+             unknown_stop_horizon_s=float(stop_limits[k]) if stop_limits is not None else None,
+             unknown_stop_min_gap=finite_gap(unknown_stop[k]) if unknown_stop is not None else None,
              static_motion_feasible=static_motion,forecast_progress=float(d0-dist[k]),cruise=cruise)
         return True,v,v*math.tan(delta)/self.geometry.wheelbase

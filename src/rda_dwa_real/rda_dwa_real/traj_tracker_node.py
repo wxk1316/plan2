@@ -240,7 +240,8 @@ class TrajTrackerNode(Node):
         if sample is not None:
             pose, stamp, age = sample
             x, y, yaw = body_pose_to_base_link(*pose, self._body_to_base_x)
-            self.core.set_pose(x, y, yaw, stamp=stamp, arrival=now-age)
+            self.core.set_pose(x, y, yaw, stamp=stamp, arrival=now-age,
+                               allow_reinitialization=self._last_plan_reason=='no_goal')
             self._loc = (x, y, yaw)
         if now-self._last_cmd_ts>self.core.p.cmd_timeout:reason='plan_timeout'
         elif now-self.core._pose_at>self.core.p.localization_timeout:reason='localization_timeout'
@@ -253,6 +254,7 @@ class TrajTrackerNode(Node):
         self._control_seq+=1
         packet=dict(schema_version=1,producer_monotonic_ns=time.monotonic_ns(),producer_ros_ns=self.get_clock().now().nanoseconds,sequence=self._control_seq,raw_dt_s=raw_dt,used_dt_s=dt,duration_s=time.monotonic()-begin,mode=self.core.mode,stage=self.core._spin_stage,session=self.core._session,result=self.core._spin_result,target_yaw_rad=self.core._spin_target,safety_reason=self.core._safety_reason,command=cmd,tracking=self.core.diag,measured_v_estimate=self.core._v_meas,yaw_rate_estimate=self.core._yaw_rate,centre=self.core._centre,rear_pose=[self.core._px,self.core._py,self.core._pyaw],pose_source_stamp=self.core._pose_stamp,pose_arrival_age_s=now-self.core._pose_at,obstacle_source_stamp=self.core._obstacle_source,obstacle_age_s=now-self.core._obstacle_at,wheel_max_cached=self.core._wheel_max,wheel_arrival_age_s=now-self.core._wheel_at,mode_echo=self.core._mode_echo,mode_echo_age_s=now-self.core._mode_echo_at,reference_seq=self.core._ref_seq,reference_age_s=now-self.core._last_traj_ts,reference_points=len(self.core._ref),steer_rate_rad_s=self.core._steer_rate,acceleration_state=self.core._acc,pid_integral=self.core._pid_i)
         packet['localization_input'] = self._localization_input.diagnostic()
+        packet['pose_reinitializations']=self.core._pose_reinitializations
         self._pub_control_diag.publish(String(data=json.dumps(safe_data(packet),allow_nan=False)))
 
     # ==================================================================

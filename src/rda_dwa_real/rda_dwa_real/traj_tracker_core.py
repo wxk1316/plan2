@@ -1,7 +1,9 @@
 """Rear-axle geometric LQR tracking and latched body-centre spin sessions.
 
-Reference paths are accepted as a complete, planner-validated sequence. No old
-far tail or independent x/y/yaw splines can change the collision-checked path.
+References preserve the planner's bounded actuator forecast. Known occupancy
+uses its long forecast; unknown occupancy uses action and braking checks with
+fresh observations at execution. No old tail or independent x/y/yaw splines
+alter that geometry.
 Localization input is the geometric centre; the conversion stays internal.
 """
 import math
@@ -9,7 +11,7 @@ from collections import deque
 import numpy as np
 from .adaptive_preview import AdaptivePreview
 from .pose_velocity import PoseVelocityEstimator
-from rda_dwa.motion_safety import VehicleGeometry,rollout_rear,to_centres,minimum_gaps,steering_step,speed_step
+from rda_dwa.motion_safety import VehicleGeometry,rollout_rear,to_centres,minimum_gaps,steering_step,speed_step,unknown_command_gap
 
 def wrap_angle(a):return (float(a)+math.pi)%(2*math.pi)-math.pi
 
@@ -67,18 +69,23 @@ class TrajTrackerCore:
         self._px=self._py=self._pyaw=0.;self._centre=(0.,0.);self._pose_inited=False;self._pose_stamp=None;self._pose_at=-1e9
         self._pose_history=deque(maxlen=100);self._v_meas=0.;self._yaw_rate=0.;self._wheel_max=None;self._wheel_at=-1e9
         self._velocity_estimator=PoseVelocityEstimator()
+        self._pose_reinitializations=0
         self._ref=[];self._s_arr=np.zeros(0);self._t_arr=np.zeros(0);self._bs=None;self._ref_seq=-1;self._last_traj_ts=-1e9
         self._s_veh=0.;self._proj_idx=0;self._clear_count=0;self._clear_seq=-1
         self._last_steer=0.;self._steer_rate=0.;self._last_v_out=0.;self._acc=0.;self._pid_i=0.;self._pid_prev_err=0.
         self._pid_act_stall=False;self._diag={};self._transitions=[];self._obstacles=[];self._obstacle_at=-1e9;self._obstacle_source=None
-    def set_pose(self,x,y,yaw,dt=0.,stamp=None,arrival=None):
+    def set_pose(self,x,y,yaw,dt=0.,stamp=None,arrival=None,allow_reinitialization=False):
         if not all(math.isfinite(float(v)) for v in (x,y,yaw)):self.set_safety('invalid_localization');return
         if stamp is not None and self._pose_stamp is not None and stamp<=self._pose_stamp:return
         rx=x-self.geometry.rear_offset*math.cos(yaw);ry=y-self.geometry.rear_offset*math.sin(yaw)
         source_dt=stamp-self._pose_stamp if stamp is not None and self._pose_stamp is not None else dt
         if self._pose_inited and source_dt>1e-4:
             dx,dy=rx-self._px,ry-self._py;dth=wrap_angle(yaw-self._pyaw)
-            if math.hypot(dx,dy)>max(.15,3*source_dt) or abs(dth)>max(.2,4*source_dt):self.set_safety('localization_jump');return
+            if math.hypot(dx,dy)>max(.15,3*source_dt) or abs(dth)>max(.2,4*source_dt):
+                if allow_reinitialization and self.mode==self.MODE_ACK and self._last_v_out<.01:
+                    self.clear_path('manual_localization_reinitialized');self._pose_history.clear();self._velocity_estimator.reset()
+                    self._v_meas=self._yaw_rate=0.;self._pose_reinitializations+=1
+                else:self.set_safety('localization_jump');return
         effective_stamp=stamp if stamp is not None else (arrival if arrival is not None else (self._pose_stamp or 0.)+dt)
         estimate=self._velocity_estimator.update(rx,ry,yaw,effective_stamp)
         if estimate is not None:self._v_meas,self._yaw_rate=estimate
@@ -227,7 +234,12 @@ class TrajTrackerCore:
         if now-self._obstacle_at<=self.p.obstacle_timeout:
             rear,_,tt=rollout_rear(self._px,self._py,self._pyaw,max(0.,self._v_meas),self._last_steer,[v],[delta],self.geometry,max(.8,max(self._v_meas,0.)/self.p.dec_max+.6),.05,dec=self.p.dec_max,steer_rate=math.radians(self.p.max_steer_rate_deg),jerk=self.p.jerk_max,steer_accel=math.radians(self.p.max_steer_accel_deg),initial_acc=self._acc,initial_steer_rate=self._steer_rate,delay=.1)
             bound=(max(v,self._v_meas,0.)+abs(v*math.tan(delta)/self.p.wheelbase)*self.geometry.radius)*.025
-            execution_gap=float(minimum_gaps(to_centres(rear,self.geometry),tt,self._obstacles,self.geometry,now-self._obstacle_at,bound)[0])
+            known=[o for o in self._obstacles if not o.uncertain];unknown=[o for o in self._obstacles if o.uncertain]
+            execution_gap=float(minimum_gaps(to_centres(rear,self.geometry),tt,known,self.geometry,now-self._obstacle_at,bound)[0])
+            if unknown:
+                prefix=float(minimum_gaps(to_centres(rear,self.geometry),tt,unknown,self.geometry,now-self._obstacle_at,bound,valid_until=.4)[0])
+                braking=unknown_command_gap(self._px,self._py,self._pyaw,max(0.,self._v_meas),self._last_steer,v,delta,unknown,self.geometry,now-self._obstacle_at,self._acc,self._steer_rate)
+                execution_gap=min(execution_gap,prefix,braking)
             if execution_gap<self.p.safety_margin:
                 self._diag={'branch':'EXECUTION_GUARD','min_predicted_gap':execution_gap,'required_margin':self.p.safety_margin,'preview':preview_diag,'obstacle_age_s':now-self._obstacle_at};return self.stop_cmd()
         self._diag={'branch':'LQR','preview':preview_diag,'speed_preview_distance_m':self.p.speed_preview_distance,'min_predicted_gap':execution_gap,'required_margin':self.p.safety_margin,'e_y':ey,'e_th':eth,'kappa_ref':look[4],'delta_ff':ff,'correction':corr,'v_ref':cap,'v_out':v,'s':s,'ahead':self.ref_ahead()}
